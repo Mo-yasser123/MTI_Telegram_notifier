@@ -1,24 +1,22 @@
-import discord
-import os
-import json
-import asyncio
-from dotenv import load_dotenv
+import requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+import os
+import json
+from dotenv import load_dotenv
 
 load_dotenv()
-# تأكد أن المتغيرات السرية في GitHub تحمل هذه الأسماء بالضبط
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-CHANNEL_ID = os.getenv('CHANNEL_ID')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+CHAT_ID = os.getenv('CHAT_ID')
 UNI_USER = os.getenv('UNI_USER')
 UNI_PASS = os.getenv('UNI_PASS')
 
 def load_sent_events():
     try:
-        # التعديل الجوهري لتخطي بصمة BOM
+        # استخدام utf-8-sig وتفادي خطأ JSONDecodeError إذا كان الملف فارغاً تماماً
         with open('sent_events.json', 'r', encoding='utf-8-sig') as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
@@ -72,24 +70,39 @@ def scrape_moodle():
         
     return new_events
 
-intents = discord.Intents.default()
-client = discord.Client(intents=intents)
+def send_telegram_message(events):
+    for event in events:
+        course_name = event['title']
+        task_type = "تحديث جامعي"
+        
+        if "-" in course_name:
+            parts = course_name.split("-")
+            course_name = parts[0].replace("F26", "").strip()
+            task_type = parts[1].strip()
 
-@client.event
-async def on_ready():
-    print(f'Logged in as {client.user}')
-    
-    upcoming_events = scrape_moodle()
-    
-    if upcoming_events:
+        message = f"🚨 <b>{task_type}</b>\n\n"
+        message += f"📚 <b>المادة:</b> <code>{course_name}</code>\n"
+        message += f"⏳ <b>الموعد:</b> {event['date']}\n\n"
+        message += f"🔗 <a href='https://elearning-01.mti.edu.eg/'>الدخول لمنصة MTI</a>"
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        
+        # البلوك السليم برمجياً والذي لا يحتوي على Syntax Error
         try:
-            # تحويل معرف القناة إلى رقم صحيح (Integer)
-            channel = client.get_channel(int(CHANNEL_ID))
-            if channel:
-                for event in upcoming_events:
-                    course_name = event['title']
-                    task_type = "تحديث جامعي"
-                    
-                    if "-" in course_name:
-                        parts = course_name.split("-")
-                        course_name
+            response = requests.post(url, json=payload)
+            if response.status_code == 200:
+                print(f"Successfully sent: {course_name}")
+            else:
+                print(f"Failed to send: {response.text}")
+        except Exception as e:
+            print(f"Telegram API error: {e}")
+
+if __name__ == "__main__":
+    upcoming_events = scrape_moodle()
+    if upcoming_events:
+        send_telegram_message(upcoming_events)
