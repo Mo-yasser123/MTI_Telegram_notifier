@@ -1,4 +1,4 @@
-﻿import requests
+import requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
@@ -16,10 +16,13 @@ UNI_PASS = os.getenv('UNI_PASS')
 
 def load_sent_events():
     try:
-        with open('sent_events.json', 'r', encoding='utf-8') as f:
+        # استخدام utf-8-sig لتخطي بصمة BOM التي أضافها PowerShell
+        with open('sent_events.json', 'r', encoding='utf-8-sig') as f:
             return json.load(f)
     except FileNotFoundError:
         return []
+    except json.JSONDecodeError:
+        return [] # لتفادي توقف الكود إذا كان الملف فارغاً تماماً أو تالفاً
 
 def save_sent_event(event_id):
     events = load_sent_events()
