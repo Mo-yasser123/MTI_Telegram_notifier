@@ -16,7 +16,6 @@ UNI_PASS = os.getenv('UNI_PASS')
 
 def load_sent_events():
     try:
-        # استخدام utf-8-sig وتفادي خطأ JSONDecodeError إذا كان الملف فارغاً تماماً
         with open('sent_events.json', 'r', encoding='utf-8-sig') as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
@@ -92,7 +91,6 @@ def send_telegram_message(events):
             "parse_mode": "HTML"
         }
         
-        # البلوك السليم برمجياً والذي لا يحتوي على Syntax Error
         try:
             response = requests.post(url, json=payload)
             if response.status_code == 200:
@@ -106,3 +104,5 @@ if __name__ == "__main__":
     upcoming_events = scrape_moodle()
     if upcoming_events:
         send_telegram_message(upcoming_events)
+    else:
+        print("No new events to save")
