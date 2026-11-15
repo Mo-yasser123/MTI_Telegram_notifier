@@ -1,4 +1,4 @@
-name: MTI Telegram Scraper
+name: MTI Telegram Scraper (Telegram)
 
 on:
   schedule:
