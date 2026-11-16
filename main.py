@@ -15,6 +15,22 @@ CHAT_ID = os.getenv('CHAT_ID')
 UNI_USER = os.getenv('UNI_USER')
 UNI_PASS = os.getenv('UNI_PASS')
 
+def get_professor_name(course_name):
+    name_lower = course_name.lower()
+    if "english" in name_lower:
+        return "Dr. Rasha Saeed"
+    elif "programming" in name_lower or "cs-112" in name_lower:
+        return "Dr. HAFEZ M.S. ABDEL-WAHAB"
+    elif "computer science" in name_lower or "cs-111" in name_lower:
+        return "Dr. Mohamed M. Elgazzar"
+    elif "linear algebra" in name_lower:
+        return "Walid Basiony"
+    elif "analysis" in name_lower or "mathematical" in name_lower:
+        return "Dr. Rania Ahmed"
+    elif "entrepreneur" in name_lower:
+        return "Dr. El-sayed Orabi"
+    return "Not Specified"
+
 def load_sent_events():
     try:
         with open('sent_events.json', 'r', encoding='utf-8-sig') as f:
@@ -49,8 +65,7 @@ def scrape_moodle():
         login_btn = driver.find_element(By.ID, "loginbtn")
         driver.execute_script("arguments[0].click();", login_btn)
         
-        # Wait for Upcoming Events block to fully load via AJAX
-        time.sleep(5)
+        time.sleep(5) # Wait for AJAX elements
         
         WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CLASS_NAME, "event")))
         events = driver.find_elements(By.CLASS_NAME, "event")
@@ -60,22 +75,18 @@ def scrape_moodle():
         for event in events:
             try:
                 title_el = event.find_element(By.CSS_SELECTOR, "a.text-truncate")
-                
-                # Extract full title
                 raw_title = title_el.get_attribute("title")
                 if not raw_title:
                     raw_title = title_el.get_attribute("textContent")
                 raw_title = raw_title.strip()
                 
-                # Extract Direct Link to the assignment/quiz
                 event_link = title_el.get_attribute("href")
                 if not event_link:
                     event_link = "https://elearning-01.mti.edu.eg/"
                 
-                # Extract Date and Time
                 date_el = event.find_element(By.CSS_SELECTOR, "div.date.small")
                 date_time = date_el.get_attribute("textContent").strip()
-                date_time = " ".join(date_time.split()) # Clean up extra spaces
+                date_time = " ".join(date_time.split())
                 
                 event_id = f"{raw_title}_{date_time}"
                 
@@ -88,7 +99,7 @@ def scrape_moodle():
                     })
                     save_sent_event(event_id)
             except Exception as inner_e:
-                print(f"Error parsing single event: {inner_e}")
+                print(f"Error parsing event: {inner_e}")
                 continue
                 
     except Exception as e:
@@ -104,17 +115,18 @@ def send_telegram_message(events):
         course_name = "Check Link For Details"
         task_name = raw_title
         
-        # Smart Parsing: Split course name and task if hyphen exists
         if "-" in raw_title:
-            parts = raw_title.split("-", 1) # Split only at the first hyphen
+            parts = raw_title.split("-", 1)
             course_name = parts[0].replace("F26", "").strip()
             task_name = parts[1].strip()
         elif " is due" in raw_title:
             task_name = raw_title.replace(" is due", "").strip()
 
-        # Build English Telegram Message
+        professor = get_professor_name(course_name)
+
         message = f"🚨 <b>New Academic Update</b>\n\n"
         message += f"📚 <b>Course:</b> <code>{course_name}</code>\n"
+        message += f"👨‍🏫 <b>Professor:</b> {professor}\n"
         message += f"📝 <b>Task:</b> {task_name}\n"
         message += f"⏳ <b>Deadline:</b> {event['date']}\n\n"
         message += f"🔗 <a href='{event['link']}'><b>Click here to view details</b></a>"
@@ -124,7 +136,7 @@ def send_telegram_message(events):
             "chat_id": CHAT_ID,
             "text": message,
             "parse_mode": "HTML",
-            "disable_web_page_preview": True # Keeps message clean without large thumbnails
+            "disable_web_page_preview": True
         }
         
         try:
@@ -137,7 +149,7 @@ def send_telegram_message(events):
             print(f"Telegram API error: {e}")
 
 if __name__ == "__main__":
-    print("Starting MTI Moodle Scraper...")
+    print("Starting MTI Telegram Scraper...")
     upcoming_events = scrape_moodle()
     if upcoming_events:
         send_telegram_message(upcoming_events)
