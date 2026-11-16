@@ -17,15 +17,15 @@ UNI_PASS = os.getenv('UNI_PASS')
 
 def get_professor_name(course_name):
     name_lower = course_name.lower()
-    if "english" in name_lower:
+    if "english language" in name_lower:
         return "Dr. Rasha Saeed"
-    elif "programming" in name_lower or "cs-112" in name_lower:
+    elif "introduction to programming" in name_lower:
         return "Dr. HAFEZ M.S. ABDEL-WAHAB"
-    elif "computer science" in name_lower or "cs-111" in name_lower:
+    elif "introduction to computer science" in name_lower:
         return "Dr. Mohamed M. Elgazzar"
     elif "linear algebra" in name_lower:
         return "Walid Basiony"
-    elif "analysis" in name_lower or "mathematical" in name_lower:
+    elif "mathematical analysis" in name_lower:
         return "Dr. Rania Ahmed"
     elif "entrepreneur" in name_lower:
         return "Dr. El-sayed Orabi"
@@ -65,7 +65,7 @@ def scrape_moodle():
         login_btn = driver.find_element(By.ID, "loginbtn")
         driver.execute_script("arguments[0].click();", login_btn)
         
-        time.sleep(5) # Wait for AJAX elements
+        time.sleep(5)
         
         WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CLASS_NAME, "event")))
         events = driver.find_elements(By.CLASS_NAME, "event")
