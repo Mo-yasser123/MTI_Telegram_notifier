@@ -2,7 +2,7 @@ name: MTI Telegram Scraper (Telegram)
 
 on:
   schedule:
-    - cron: '0 */3 * * *'
+    - cron: '0 * * * *'  
   workflow_dispatch:
 
 jobs:
