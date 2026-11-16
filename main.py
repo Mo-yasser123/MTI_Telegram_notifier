@@ -113,24 +113,21 @@ def scrape_moodle():
                         if active_modal:
                             desc_elements = active_modal.find_elements(By.CLASS_NAME, "description-content")
                             if desc_elements:
-                                description = desc_elements[0].get_attribute("textContent").strip()
+                                raw_desc = desc_elements[0].get_attribute("textContent").strip()
+                                # استبدال المسافات المتعددة والأسطر الجديدة بمسافة واحدة لتنظيف النص
+                                description = " ".join(raw_desc.split())
                             
                             links = active_modal.find_elements(By.TAG_NAME, "a")
-                            valid_links = []
                             for link in links:
-                                txt = link.get_attribute("textContent").strip()
-                                if txt and txt != raw_title and "http" not in txt:
-                                    # استبعاد الروابط التي تحتوي على أيام الأسبوع أو AM/PM (غالباً هي روابط التقويم)
-                                    if not any(d in txt for d in [" AM", " PM", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]):
-                                        valid_links.append(txt)
-                            
-                            if valid_links:
-                                course_name = valid_links[-1] # اسم المادة غالباً يكون الرابط الأخير في النافذة
+                                href = link.get_attribute("href")
+                                # الفلترة الدقيقة: اسم المادة دائماً يحتوي على course/view.php في رابطه
+                                if href and "course/view.php" in href:
+                                    course_name = link.get_attribute("textContent").strip()
+                                    break
                                 
                     except Exception as modal_e:
                         print(f"Could not parse modal for {raw_title}: {modal_e}")
                     
-                    # إجبار المتصفح على ضغط زر ESC لإغلاق النافذة بنجاح وعدم تداخل البيانات
                     try:
                         ActionChains(driver).send_keys(Keys.ESCAPE).perform()
                         time.sleep(1)
@@ -163,7 +160,6 @@ def send_telegram_message(events):
         raw_title = event['raw_title']
         task_name = raw_title
         
-        # الاعتماد على اسم المادة من النافذة إن وُجد، وإلا استخدام الـ Fallback
         if event.get("course_name_from_modal"):
             course_name = event["course_name_from_modal"]
         elif "-" in raw_title:
@@ -185,7 +181,7 @@ def send_telegram_message(events):
         message += f"⏳ <b>Deadline:</b> {event['date']}\n"
         
         if event.get("description"):
-            desc = " ".join(event["description"].split())
+            desc = event["description"]
             if len(desc) > 100:
                 desc = desc[:97] + "..."
             message += f"ℹ️ <b>Details:</b> <i>{desc}</i>\n"
