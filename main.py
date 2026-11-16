@@ -6,6 +6,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import os
 import json
+import time  # ضروري لانتظار تحميل البلوكات
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -48,19 +49,37 @@ def scrape_moodle():
         login_btn = driver.find_element(By.ID, "loginbtn")
         driver.execute_script("arguments[0].click();", login_btn)
         
+        # إجبار البوت على الانتظار 5 ثوانٍ ليتم تحميل Upcoming events بالكامل
+        time.sleep(5)
+        
         WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CLASS_NAME, "event")))
         events = driver.find_elements(By.CLASS_NAME, "event")
         
         saved_events = load_sent_events()
         
         for event in events:
-            title = event.find_element(By.CSS_SELECTOR, "a.text-truncate").text
-            date_time = event.find_element(By.CSS_SELECTOR, "div.date.small").text.strip()
-            event_id = f"{title}_{date_time}"
-            
-            if event_id not in saved_events:
-                new_events.append({"title": title, "date": date_time, "id": event_id})
-                save_sent_event(event_id)
+            try:
+                # استخدام title و textContent لضمان جلب النص حتى لو كان مخفياً
+                title_el = event.find_element(By.CSS_SELECTOR, "a.text-truncate")
+                title = title_el.get_attribute("title")
+                if not title:
+                    title = title_el.get_attribute("textContent")
+                title = title.strip()
+                
+                date_el = event.find_element(By.CSS_SELECTOR, "div.date.small")
+                date_time = date_el.get_attribute("textContent").strip()
+                
+                # تنظيف النص من أي مسافات زائدة
+                date_time = " ".join(date_time.split())
+                
+                event_id = f"{title}_{date_time}"
+                
+                if event_id not in saved_events:
+                    new_events.append({"title": title, "date": date_time, "id": event_id})
+                    save_sent_event(event_id)
+            except Exception as inner_e:
+                print(f"Error parsing single event: {inner_e}")
+                continue
                 
     except Exception as e:
         print(f"Scraping error: {e}")
