@@ -4,6 +4,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
 import os
 import json
 import time
@@ -72,10 +74,8 @@ def scrape_moodle():
         
         saved_events = load_sent_events()
         
-        # نستخدم فهرس لتجنب مشاكل العناصر القديمة (StaleElementReferenceException) بعد فتح وإغلاق النافذة
         for i in range(len(events)):
             try:
-                # إعادة إيجاد العناصر في كل لفة
                 current_events = driver.find_elements(By.CLASS_NAME, "event")
                 event = current_events[i]
                 
@@ -96,41 +96,47 @@ def scrape_moodle():
                 event_id = f"{raw_title}_{date_time}"
                 
                 if event_id not in saved_events:
-                    # الضغط على الحدث لفتح النافذة المنبثقة
                     driver.execute_script("arguments[0].click();", title_el)
-                    time.sleep(2) # انتظار فتح النافذة
+                    time.sleep(2)
                     
-                    course_name = "Not Found"
+                    course_name = None
                     description = ""
                     
                     try:
-                        # محاولة استخراج اسم المادة من النافذة (عادة يكون رابطاً بداخلها)
-                        modal = driver.find_element(By.CLASS_NAME, "modal-content")
-                        # البحث عن روابط داخل النافذة المنبثقة قد تكون اسم المادة
-                        links = modal.find_elements(By.TAG_NAME, "a")
-                        for link in links:
-                            link_text = link.get_attribute("textContent").strip()
-                            if link_text and link_text != raw_title and "http" not in link_text:
-                                course_name = link_text
+                        modals = driver.find_elements(By.CLASS_NAME, "modal-content")
+                        active_modal = None
+                        for m in modals:
+                            if m.is_displayed():
+                                active_modal = m
                                 break
                         
-                        # محاولة استخراج الوصف
-                        desc_elements = modal.find_elements(By.CLASS_NAME, "description-content")
-                        if desc_elements:
-                             description = desc_elements[0].get_attribute("textContent").strip()
-
+                        if active_modal:
+                            desc_elements = active_modal.find_elements(By.CLASS_NAME, "description-content")
+                            if desc_elements:
+                                description = desc_elements[0].get_attribute("textContent").strip()
+                            
+                            links = active_modal.find_elements(By.TAG_NAME, "a")
+                            valid_links = []
+                            for link in links:
+                                txt = link.get_attribute("textContent").strip()
+                                if txt and txt != raw_title and "http" not in txt:
+                                    # استبعاد الروابط التي تحتوي على أيام الأسبوع أو AM/PM (غالباً هي روابط التقويم)
+                                    if not any(d in txt for d in [" AM", " PM", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]):
+                                        valid_links.append(txt)
+                            
+                            if valid_links:
+                                course_name = valid_links[-1] # اسم المادة غالباً يكون الرابط الأخير في النافذة
+                                
                     except Exception as modal_e:
                         print(f"Could not parse modal for {raw_title}: {modal_e}")
                     
-                    # إغلاق النافذة
+                    # إجبار المتصفح على ضغط زر ESC لإغلاق النافذة بنجاح وعدم تداخل البيانات
                     try:
-                         close_btn = driver.find_element(By.CSS_SELECTOR, "button.close, button.btn-close, [data-dismiss='modal'], [data-bs-dismiss='modal']")
-                         driver.execute_script("arguments[0].click();", close_btn)
-                         time.sleep(1)
-                    except Exception as close_e:
-                         print("Could not close modal, refreshing page.")
-                         driver.refresh()
-                         time.sleep(5)
+                        ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+                        time.sleep(1)
+                    except:
+                        driver.refresh()
+                        time.sleep(5)
 
                     new_events.append({
                         "raw_title": raw_title, 
@@ -157,8 +163,8 @@ def send_telegram_message(events):
         raw_title = event['raw_title']
         task_name = raw_title
         
-        # تحديد اسم المادة
-        if event.get("course_name_from_modal") and event["course_name_from_modal"] != "Not Found":
+        # الاعتماد على اسم المادة من النافذة إن وُجد، وإلا استخدام الـ Fallback
+        if event.get("course_name_from_modal"):
             course_name = event["course_name_from_modal"]
         elif "-" in raw_title:
              parts = raw_title.split("-", 1)
@@ -179,7 +185,6 @@ def send_telegram_message(events):
         message += f"⏳ <b>Deadline:</b> {event['date']}\n"
         
         if event.get("description"):
-            # تنظيف الوصف و قصّه إذا كان طويلاً جداً
             desc = " ".join(event["description"].split())
             if len(desc) > 100:
                 desc = desc[:97] + "..."
