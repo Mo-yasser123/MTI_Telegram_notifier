@@ -6,7 +6,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import os
 import json
-import time  # ضروري لانتظار تحميل البلوكات
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -49,7 +49,7 @@ def scrape_moodle():
         login_btn = driver.find_element(By.ID, "loginbtn")
         driver.execute_script("arguments[0].click();", login_btn)
         
-        # إجبار البوت على الانتظار 5 ثوانٍ ليتم تحميل Upcoming events بالكامل
+        # Wait for Upcoming Events block to fully load via AJAX
         time.sleep(5)
         
         WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CLASS_NAME, "event")))
@@ -59,23 +59,33 @@ def scrape_moodle():
         
         for event in events:
             try:
-                # استخدام title و textContent لضمان جلب النص حتى لو كان مخفياً
                 title_el = event.find_element(By.CSS_SELECTOR, "a.text-truncate")
-                title = title_el.get_attribute("title")
-                if not title:
-                    title = title_el.get_attribute("textContent")
-                title = title.strip()
                 
+                # Extract full title
+                raw_title = title_el.get_attribute("title")
+                if not raw_title:
+                    raw_title = title_el.get_attribute("textContent")
+                raw_title = raw_title.strip()
+                
+                # Extract Direct Link to the assignment/quiz
+                event_link = title_el.get_attribute("href")
+                if not event_link:
+                    event_link = "https://elearning-01.mti.edu.eg/"
+                
+                # Extract Date and Time
                 date_el = event.find_element(By.CSS_SELECTOR, "div.date.small")
                 date_time = date_el.get_attribute("textContent").strip()
+                date_time = " ".join(date_time.split()) # Clean up extra spaces
                 
-                # تنظيف النص من أي مسافات زائدة
-                date_time = " ".join(date_time.split())
-                
-                event_id = f"{title}_{date_time}"
+                event_id = f"{raw_title}_{date_time}"
                 
                 if event_id not in saved_events:
-                    new_events.append({"title": title, "date": date_time, "id": event_id})
+                    new_events.append({
+                        "raw_title": raw_title, 
+                        "date": date_time, 
+                        "link": event_link,
+                        "id": event_id
+                    })
                     save_sent_event(event_id)
             except Exception as inner_e:
                 print(f"Error parsing single event: {inner_e}")
@@ -90,38 +100,46 @@ def scrape_moodle():
 
 def send_telegram_message(events):
     for event in events:
-        course_name = event['title']
-        task_type = "تحديث جامعي"
+        raw_title = event['raw_title']
+        course_name = "Check Link For Details"
+        task_name = raw_title
         
-        if "-" in course_name:
-            parts = course_name.split("-")
+        # Smart Parsing: Split course name and task if hyphen exists
+        if "-" in raw_title:
+            parts = raw_title.split("-", 1) # Split only at the first hyphen
             course_name = parts[0].replace("F26", "").strip()
-            task_type = parts[1].strip()
+            task_name = parts[1].strip()
+        elif " is due" in raw_title:
+            task_name = raw_title.replace(" is due", "").strip()
 
-        message = f"🚨 <b>{task_type}</b>\n\n"
-        message += f"📚 <b>المادة:</b> <code>{course_name}</code>\n"
-        message += f"⏳ <b>الموعد:</b> {event['date']}\n\n"
-        message += f"🔗 <a href='https://elearning-01.mti.edu.eg/'>الدخول لمنصة MTI</a>"
+        # Build English Telegram Message
+        message = f"🚨 <b>New Academic Update</b>\n\n"
+        message += f"📚 <b>Course:</b> <code>{course_name}</code>\n"
+        message += f"📝 <b>Task:</b> {task_name}\n"
+        message += f"⏳ <b>Deadline:</b> {event['date']}\n\n"
+        message += f"🔗 <a href='{event['link']}'><b>Click here to view details</b></a>"
 
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {
             "chat_id": CHAT_ID,
             "text": message,
-            "parse_mode": "HTML"
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True # Keeps message clean without large thumbnails
         }
         
         try:
             response = requests.post(url, json=payload)
             if response.status_code == 200:
-                print(f"Successfully sent: {course_name}")
+                print(f"Successfully sent: {task_name}")
             else:
                 print(f"Failed to send: {response.text}")
         except Exception as e:
             print(f"Telegram API error: {e}")
 
 if __name__ == "__main__":
+    print("Starting MTI Moodle Scraper...")
     upcoming_events = scrape_moodle()
     if upcoming_events:
         send_telegram_message(upcoming_events)
     else:
-        print("No new events to save")
+        print("No new events found.")
