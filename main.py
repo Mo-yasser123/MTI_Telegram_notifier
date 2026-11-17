@@ -228,7 +228,7 @@ def send_telegram_messages(data):
         course_name = grade['course_name']
         link = grade['link']
         
-        message = f"🎉 <b>منورين يا شباب...</b>\n\n"
+        message = f" <b>منورين يا شباب...</b>\n\n"
         message += f"📊 <b>درجه امتحان</b> <code>{course_name}</code> <b>نزل.</b>\n\n"
         message += f"🔗 <a href='{link}'><b>اضغط هنا لمعرفة النتيجة</b></a>"
         
