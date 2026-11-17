@@ -2,26 +2,35 @@ name: MTI Telegram Scraper
 
 on:
   schedule:
-    - cron: '0 * * * *' # التشغيل التلقائي كل ساعة
+    - cron: '17 * * * *' # كل ساعة في الدقيقة 17 (أقل زحمة من الدقيقة 0)
   workflow_dispatch: # زر التشغيل اليدوي للطوارئ
+
+# صلاحية الكتابة علشان الـ push يشتغل (حل خطأ 403)
+permissions:
+  contents: write
+
+# يمنع تشغيل نسختين فوق بعض
+concurrency:
+  group: mti-scraper
+  cancel-in-progress: false
 
 jobs:
   scrape-and-notify:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.10'
+        cache: pip
 
     - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install selenium requests python-dotenv
+      run: pip install selenium requests python-dotenv
 
     - name: Run MTI Scraper
       env:
@@ -31,11 +40,12 @@ jobs:
         UNI_PASS: ${{ secrets.UNI_PASS }}
       run: python main.py
 
+    # always() علشان لو السكربت وقع بعد ما بعت رسايل، الـ IDs تتحفظ برضه
     - name: Commit and push memory (JSON files)
+      if: always()
       run: |
-        git config --global user.name "github-actions[bot]"
-        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
         git add sent_events.json sent_grades.json
-        # هذا السطر يمنع حدوث خطأ إذا لم يجد البوت تكليفات جديدة لعمل حفظ لها
-        git diff --quiet && git diff --staged --quiet || git commit -m "Update bot memory"
-        git push
+        # لو مفيش تغيير، مفيش commit ولا push
+        git diff --cached --quiet || (git commit -m "Update bot memory" && git push)
