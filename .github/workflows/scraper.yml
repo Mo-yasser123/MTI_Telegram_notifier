@@ -1,41 +1,41 @@
-name: MTI Telegram Scraper (Telegram)
+name: MTI Telegram Scraper
 
 on:
   schedule:
-    - cron: '0 * * * *'  
-  workflow_dispatch:
+    - cron: '0 * * * *' # التشغيل التلقائي كل ساعة
+  workflow_dispatch: # زر التشغيل اليدوي للطوارئ
 
 jobs:
-  run-bot:
+  scrape-and-notify:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v3
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
 
-      - name: Install Dependencies
-        run: |
-          pip install requests selenium python-dotenv
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install selenium requests python-dotenv
 
-      - name: Run Scraper Script
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-          UNI_USER: ${{ secrets.UNI_USER }}
-          UNI_PASS: ${{ secrets.UNI_PASS }}
-        run: python main.py
+    - name: Run MTI Scraper
+      env:
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        CHAT_ID: ${{ secrets.CHAT_ID }}
+        UNI_USER: ${{ secrets.UNI_USER }}
+        UNI_PASS: ${{ secrets.UNI_PASS }}
+      run: python main.py
 
-      - name: Save sent events back to repository
-        run: |
-          git config --global user.name "GitHub Actions Bot"
-          git config --global user.email "actions@github.com"
-          git add sent_events.json
-          git commit -m "Update sent events [skip ci]" || echo "No new events to save"
-          git push
+    - name: Commit and push memory (JSON files)
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        git add sent_events.json sent_grades.json
+        # هذا السطر يمنع حدوث خطأ إذا لم يجد البوت تكليفات جديدة لعمل حفظ لها
+        git diff --quiet && git diff --staged --quiet || git commit -m "Update bot memory"
+        git push
