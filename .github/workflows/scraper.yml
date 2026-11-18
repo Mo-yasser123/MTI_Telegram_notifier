@@ -1,51 +1,56 @@
-name: MTI Telegram Scraper
+name: MTI Telegram Bot
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: '17 * * * *' # كل ساعة في الدقيقة 17 (أقل زحمة من الدقيقة 0)
-  workflow_dispatch: # زر التشغيل اليدوي للطوارئ
+    # شبكة أمان احتياطية كل ساعتين لو cron-job.org وقع مؤقتاً
+    - cron: '17 */2 * * *'
 
-# صلاحية الكتابة علشان الـ push يشتغل (حل خطأ 403)
 permissions:
   contents: write
 
-# يمنع تشغيل نسختين فوق بعض
 concurrency:
-  group: mti-scraper
+  group: mti-telegram-bot
   cancel-in-progress: false
 
 jobs:
-  scrape-and-notify:
+  run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
-        cache: pip
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-    - name: Install dependencies
-      run: pip install selenium requests python-dotenv
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 python-dotenv
 
-    - name: Run MTI Scraper
-      env:
-        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-        CHAT_ID: ${{ secrets.CHAT_ID }}
-        UNI_USER: ${{ secrets.UNI_USER }}
-        UNI_PASS: ${{ secrets.UNI_PASS }}
-      run: python main.py
+      - name: Run MTI Bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          UNI_USER: ${{ secrets.UNI_USER }}
+          UNI_PASS: ${{ secrets.UNI_PASS }}
+        run: python main.py
 
-    # always() علشان لو السكربت وقع بعد ما بعت رسايل، الـ IDs تتحفظ برضه
-    - name: Commit and push memory (JSON files)
-      if: always()
-      run: |
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        git add sent_events.json sent_grades.json
-        # لو مفيش تغيير، مفيش commit ولا push
-        git diff --cached --quiet || (git commit -m "Update bot memory" && git push)
+      - name: Save bot memory
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          [ -f sent_events.json ] || echo "[]" > sent_events.json
+          [ -f sent_grades.json ] || echo "[]" > sent_grades.json
+
+          git add sent_events.json sent_grades.json
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Update bot memory [skip ci]"
+            git pull --rebase origin "${{ github.ref_name }}"
+            git push
+          fi
