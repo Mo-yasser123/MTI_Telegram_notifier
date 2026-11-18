@@ -268,7 +268,7 @@ def build_grade_message(grade):
     safe_course = html.escape(grade["course_name"])
     safe_link = html.escape(grade["link"], quote=True)
 
-    message = "🎉 <b>منورين يا شباب...</b>\n\n"
+    message = " <b>منورين يا شباب...</b>\n\n"
     message += f"📊 <b>درجة امتحان</b> <code>{safe_course}</code> <b>نزلت.</b>\n\n"
     message += f"🔗 <a href='{safe_link}'><b>اضغط هنا لمعرفة النتيجة</b></a>"
     return message
