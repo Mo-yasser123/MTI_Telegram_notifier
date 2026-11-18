@@ -1,21 +1,35 @@
-import requests
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.common.action_chains import ActionChains
 import os
+import sys
 import json
+import re
+import html
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-load_dotenv()
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-CHAT_ID = os.getenv('CHAT_ID')
-UNI_USER = os.getenv('UNI_USER')
-UNI_PASS = os.getenv('UNI_PASS')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+UNI_USER = os.getenv("UNI_USER")
+UNI_PASS = os.getenv("UNI_PASS")
+
+BASE_URL = "https://elearning-01.mti.edu.eg"
+EVENTS_FILE = os.path.join(BASE_DIR, "sent_events.json")
+GRADES_FILE = os.path.join(BASE_DIR, "sent_grades.json")
+CAIRO_TZ = ZoneInfo("Africa/Cairo")
+MAX_SAVED = 500
+REQUEST_TIMEOUT = 25
+
+
+# ==========================================
+# أدوات مساعدة
+# ==========================================
 def get_professor_name(course_name):
     name_lower = course_name.lower()
     if "english language" in name_lower:
@@ -32,230 +46,270 @@ def get_professor_name(course_name):
         return "Dr. El-sayed Orabi"
     return "Not Specified"
 
+
 def load_json(filename):
     try:
-        with open(filename, 'r', encoding='utf-8-sig') as f:
-            return json.load(f)
+        with open(filename, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
     except (FileNotFoundError, json.JSONDecodeError):
         return []
 
+
 def save_json(filename, data):
-    with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data[-MAX_SAVED:], f, ensure_ascii=False, indent=4)
 
-def scrape_moodle():
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--window-size=1920,1080")
-    
-    # تحسينات السرعة لضمان عدم توقف السكربت (Timeouts)
-    chrome_options.page_load_strategy = 'eager'
-    chrome_options.add_argument("--blink-settings=imagesEnabled=false")
-    
-    driver = webdriver.Chrome(options=chrome_options)
-    wait = WebDriverWait(driver, 10) # استخدام الانتظار الديناميكي
-    
+
+def build_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/130.0.0.0 Safari/537.36"
+        )
+    })
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+# ==========================================
+# تسجيل الدخول والسحب من Moodle
+# ==========================================
+def login_moodle(session):
+    login_url = f"{BASE_URL}/login/index.php"
+    resp = session.get(login_url, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+
+    token_match = re.search(r'name="logintoken"\s+value="([^"]+)"', resp.text)
+    if not token_match:
+        raise RuntimeError("Could not find logintoken on Moodle login page.")
+
+    payload = {
+        "username": UNI_USER,
+        "password": UNI_PASS,
+        "logintoken": token_match.group(1),
+    }
+    post_resp = session.post(login_url, data=payload, timeout=REQUEST_TIMEOUT)
+    post_resp.raise_for_status()
+
+    if "login/index.php" in post_resp.url:
+        raise RuntimeError("Moodle login failed. Check UNI_USER and UNI_PASS.")
+
+    dash_resp = session.get(f"{BASE_URL}/my/", timeout=REQUEST_TIMEOUT)
+    dash_resp.raise_for_status()
+
+    sesskey_match = re.search(r'"sesskey"\s*:\s*"([^"]+)"', dash_resp.text)
+    if not sesskey_match:
+        raise RuntimeError("Could not extract sesskey from Moodle dashboard.")
+
+    return dash_resp.text, sesskey_match.group(1)
+
+
+def scrape_events(session, sesskey, saved_events):
     new_events = []
-    new_grades = []
+    ajax_url = (
+        f"{BASE_URL}/lib/ajax/service.php"
+        f"?sesskey={sesskey}&info=core_calendar_get_action_events_by_timesort"
+    )
+    ajax_payload = [{
+        "index": 0,
+        "methodname": "core_calendar_get_action_events_by_timesort",
+        "args": {"limitnum": 20, "timesortfrom": 0},
+    }]
 
-    try:
-        # ==========================================
-        # 1. تسجيل الدخول
-        # ==========================================
-        driver.get("https://elearning-01.mti.edu.eg/login/index.php?loginredirect=1")
-        wait.until(EC.presence_of_element_located((By.ID, "username"))).send_keys(UNI_USER)
-        driver.find_element(By.ID, "password").send_keys(UNI_PASS)
-        login_btn = driver.find_element(By.ID, "loginbtn")
-        driver.execute_script("arguments[0].click();", login_btn)
-        
-        # انتظار ظهور لوحة المنصة بدلاً من الوقت الثابت
-        wait.until(EC.presence_of_element_located((By.CLASS_NAME, "event")))
+    resp = session.post(ajax_url, json=ajax_payload, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
 
-        # ==========================================
-        # 2. سحب التكليفات (Upcoming Events)
-        # ==========================================
-        saved_events = load_json('sent_events.json')
-        try:
-            events = driver.find_elements(By.CLASS_NAME, "event")
-            for i in range(len(events)):
-                current_events = wait.until(EC.presence_of_all_elements_located((By.CLASS_NAME, "event")))
-                event = current_events[i]
-                
-                title_el = event.find_element(By.CSS_SELECTOR, "a.text-truncate")
-                raw_title = title_el.get_attribute("title") or title_el.get_attribute("textContent")
-                raw_title = raw_title.strip()
-                event_link = title_el.get_attribute("href") or "https://elearning-01.mti.edu.eg/"
-                
-                date_el = event.find_element(By.CSS_SELECTOR, "div.date.small")
-                date_time = " ".join(date_el.get_attribute("textContent").strip().split())
-                
-                event_id = f"{raw_title}_{date_time}"
-                
-                if event_id not in saved_events:
-                    driver.execute_script("arguments[0].click();", title_el)
-                    
-                    course_name = None
-                    description = ""
-                    try:
-                        # انتظار ديناميكي للنافذة المنبثقة
-                        active_modal = wait.until(EC.visibility_of_element_located((By.CLASS_NAME, "modal-content")))
-                        desc_elements = active_modal.find_elements(By.CLASS_NAME, "description-content")
-                        if desc_elements:
-                            description = " ".join(desc_elements[0].get_attribute("textContent").strip().split())
-                        
-                        links = active_modal.find_elements(By.TAG_NAME, "a")
-                        for link in links:
-                            href = link.get_attribute("href")
-                            if href and "course/view.php" in href:
-                                course_name = link.get_attribute("textContent").strip()
-                                break
-                    except:
-                        pass
-                    
-                    try:
-                        ActionChains(driver).send_keys(Keys.ESCAPE).perform()
-                        wait.until(EC.invisibility_of_element_located((By.CLASS_NAME, "modal-backdrop")))
-                    except:
-                        driver.refresh()
-                        wait.until(EC.presence_of_element_located((By.CLASS_NAME, "event")))
+    if not isinstance(data, list) or not data or data[0].get("error"):
+        raise RuntimeError(f"Moodle AJAX error: {data}")
 
-                    new_events.append({
-                        "raw_title": raw_title, "date": date_time, 
-                        "link": event_link, "id": event_id,
-                        "course_name_from_modal": course_name, "description": description
-                    })
-                    saved_events.append(event_id)
-            save_json('sent_events.json', saved_events)
-        except Exception as e:
-            print(f"Error checking events: {e}")
+    events_list = data[0].get("data", {}).get("events", [])
+    seen_now = set()
 
-        # ==========================================
-        # 3. سحب درجات الميدتيرم (Grades Scraper)
-        # ==========================================
-        saved_grades = load_json('sent_grades.json')
-        try:
-            driver.get("https://elearning-01.mti.edu.eg/my/")
-            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='course/view.php?id=']")))
-            
-            course_links = driver.find_elements(By.CSS_SELECTOR, "a[href*='course/view.php?id=']")
-            courses = {}
-            for link in course_links:
-                href = link.get_attribute("href")
-                name = link.get_attribute("textContent").strip()
-                try:
-                    c_id = href.split("id=")[1].split("&")[0]
-                    if c_id.isdigit() and name:
-                        courses[c_id] = name
-                except:
-                    continue
+    for event in events_list:
+        raw_title = (event.get("name") or "No Title").strip()
+        event_link = event.get("url") or f"{BASE_URL}/my/"
+        course_name = (event.get("course", {}).get("fullname") or "Unknown Course").strip()
 
-            keywords = ["mid", "mt", "ميد"]
-            for c_id, c_name in courses.items():
-                grade_id = f"{c_id}_midterm"
-                if grade_id in saved_grades:
-                    continue 
-                
-                grade_url = f"https://elearning-01.mti.edu.eg/grade/report/user/index.php?id={c_id}"
-                driver.get(grade_url)
-                
-                try:
-                    wait.until(EC.presence_of_element_located((By.TAG_NAME, "tr")))
-                    rows = driver.find_elements(By.TAG_NAME, "tr")
-                    for row in rows:
-                        text_content = row.get_attribute("textContent").lower()
-                        if any(kw in text_content for kw in keywords):
-                            grade_cell = row.find_element(By.CSS_SELECTOR, "[class*='column-grade']")
-                            grade_val = grade_cell.get_attribute("textContent").strip()
-                            
-                            if grade_val and grade_val != "-" and grade_val != "":
-                                new_grades.append({
-                                    "course_name": c_name,
-                                    "link": grade_url
-                                })
-                                saved_grades.append(grade_id)
-                                break 
-                except:
-                    continue
-            save_json('sent_grades.json', saved_grades)
-        except Exception as e:
-            print(f"Error checking grades: {e}")
+        raw_desc = event.get("description") or ""
+        description = BeautifulSoup(raw_desc, "html.parser").get_text(" ", strip=True) if raw_desc else ""
 
-    except Exception as e:
-        print(f"Scraping error: {e}")
-    finally:
-        driver.quit()
-        
-    return {"events": new_events, "grades": new_grades}
-
-def send_telegram_messages(data):
-    for event in data.get("events", []):
-        raw_title = event['raw_title']
-        task_name = raw_title
-        
-        if event.get("course_name_from_modal"):
-            course_name = event["course_name_from_modal"]
-        elif "-" in raw_title:
-             parts = raw_title.split("-", 1)
-             course_name = parts[0].replace("F26", "").strip()
-             task_name = parts[1].strip()
+        time_sort = event.get("timesort")
+        if time_sort:
+            date_time = datetime.fromtimestamp(time_sort, tz=CAIRO_TZ).strftime("%Y-%m-%d %I:%M %p")
         else:
-            course_name = "Check Link For Details"
+            date_time = "Unknown Time"
 
-        if " is due" in raw_title:
-            task_name = raw_title.replace(" is due", "").strip()
+        event_id = str(event.get("id") or f"{raw_title}_{date_time}")
 
-        professor = get_professor_name(course_name)
+        if event_id in saved_events or event_id in seen_now:
+            continue
+        seen_now.add(event_id)
 
-        message = f"🚨 <b>New Academic Update</b>\n\n"
-        message += f"📚 <b>Course:</b> <code>{course_name}</code>\n"
-        message += f"👨‍🏫 <b>Professor:</b> {professor}\n"
-        message += f"📝 <b>Task:</b> {task_name}\n"
-        message += f"⏳ <b>Deadline:</b> {event['date']}\n"
-        
-        if event.get("description"):
-            desc = event["description"]
-            if len(desc) > 100:
-                desc = desc[:97] + "..."
-            message += f"ℹ️ <b>Details:</b> <i>{desc}</i>\n"
+        new_events.append({
+            "id": event_id,
+            "raw_title": raw_title,
+            "date": date_time,
+            "link": event_link,
+            "course_name": course_name,
+            "description": description,
+        })
 
-        message += f"\n🔗 <a href='{event['link']}'><b>Click here to view details</b></a>"
-        send_to_telegram(message)
+    return new_events
 
-    for grade in data.get("grades", []):
-        course_name = grade['course_name']
-        link = grade['link']
-        
-        message = f" <b>منورين يا شباب...</b>\n\n"
-        message += f"📊 <b>درجه امتحان</b> <code>{course_name}</code> <b>نزل.</b>\n\n"
-        message += f"🔗 <a href='{link}'><b>اضغط هنا لمعرفة النتيجة</b></a>"
-        
-        send_to_telegram(message)
 
+def scrape_grades(session, dash_html, saved_grades):
+    new_grades = []
+    soup = BeautifulSoup(dash_html, "html.parser")
+
+    courses = {}
+    for link in soup.select("a[href*='course/view.php?id=']"):
+        href = link.get("href", "")
+        name = link.get_text(" ", strip=True)
+        match = re.search(r"id=(\d+)", href)
+        if match and name:
+            courses[match.group(1)] = name
+
+    keywords = ["mid", "mt", "ميد"]
+
+    for c_id, c_name in courses.items():
+        grade_id = f"{c_id}_midterm"
+        if grade_id in saved_grades:
+            continue
+
+        grade_url = f"{BASE_URL}/grade/report/user/index.php?id={c_id}"
+        try:
+            resp = session.get(grade_url, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            grade_soup = BeautifulSoup(resp.text, "html.parser")
+
+            for row in grade_soup.find_all("tr"):
+                row_text = row.get_text(" ", strip=True).lower()
+                if any(kw in row_text for kw in keywords):
+                    grade_cell = row.select_one("[class*='column-grade']")
+                    if not grade_cell:
+                        continue
+                    grade_val = grade_cell.get_text(strip=True)
+                    if grade_val and grade_val not in ("-", "—", ""):
+                        new_grades.append({
+                            "id": grade_id,
+                            "course_name": c_name,
+                            "link": grade_url,
+                        })
+                        break
+        except Exception as e:
+            print(f"Warning: Could not check grades for {c_name}: {e}")
+
+    return new_grades
+
+
+# ==========================================
+# تليجرام
+# ==========================================
 def send_to_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
-        "disable_web_page_preview": True
+        "disable_web_page_preview": True,
     }
     try:
-        response = requests.post(url, json=payload)
-        if response.status_code == 200:
+        response = requests.post(url, json=payload, timeout=20)
+        if response.status_code == 200 and response.json().get("ok"):
             print("Message sent successfully.")
-        else:
-            print(f"Failed to send: {response.text}")
+            return True
+        print(f"Telegram failed: {response.text}")
     except Exception as e:
         print(f"Telegram API error: {e}")
+    return False
+
+
+def build_event_message(event):
+    raw_title = event["raw_title"]
+    task_name = raw_title.replace(" is due", "").strip()
+    course_name = event["course_name"]
+    professor = get_professor_name(course_name)
+
+    safe_course = html.escape(course_name)
+    safe_prof = html.escape(professor)
+    safe_task = html.escape(task_name)
+    safe_date = html.escape(event["date"])
+    safe_link = html.escape(event["link"], quote=True)
+
+    message = "🚨 <b>New Academic Update</b>\n\n"
+    message += f"📚 <b>Course:</b> <code>{safe_course}</code>\n"
+    message += f"👨‍🏫 <b>Professor:</b> {safe_prof}\n"
+    message += f"📝 <b>Task:</b> {safe_task}\n"
+    message += f"⏳ <b>Deadline:</b> {safe_date}\n"
+
+    if event.get("description"):
+        desc = event["description"]
+        if len(desc) > 120:
+            desc = desc[:117] + "..."
+        message += f"ℹ️ <b>Details:</b> <i>{html.escape(desc)}</i>\n"
+
+    message += f"\n🔗 <a href='{safe_link}'><b>Click here to view details</b></a>"
+    return message
+
+
+def build_grade_message(grade):
+    safe_course = html.escape(grade["course_name"])
+    safe_link = html.escape(grade["link"], quote=True)
+
+    message = "🎉 <b>منورين يا شباب...</b>\n\n"
+    message += f"📊 <b>درجة امتحان</b> <code>{safe_course}</code> <b>نزلت.</b>\n\n"
+    message += f"🔗 <a href='{safe_link}'><b>اضغط هنا لمعرفة النتيجة</b></a>"
+    return message
+
+
+# ==========================================
+# التشغيل الرئيسي
+# ==========================================
+def main():
+    print("Starting MTI Telegram Scraper (Requests + BS4)...")
+
+    if not all([TELEGRAM_TOKEN, CHAT_ID, UNI_USER, UNI_PASS]):
+        raise SystemExit("Missing env vars: TELEGRAM_TOKEN, CHAT_ID, UNI_USER, UNI_PASS")
+
+    saved_events = load_json(EVENTS_FILE)
+    saved_grades = load_json(GRADES_FILE)
+
+    session = build_session()
+    dash_html, sesskey = login_moodle(session)
+
+    new_events = scrape_events(session, sesskey, saved_events)
+    new_grades = scrape_grades(session, dash_html, saved_grades)
+
+    if not new_events and not new_grades:
+        print("No new events or grades found.")
+        return
+
+    for event in new_events:
+        if send_to_telegram(build_event_message(event)):
+            saved_events.append(event["id"])
+            save_json(EVENTS_FILE, saved_events)
+
+    for grade in new_grades:
+        if send_to_telegram(build_grade_message(grade)):
+            saved_grades.append(grade["id"])
+            save_json(GRADES_FILE, saved_grades)
+
 
 if __name__ == "__main__":
-    print("Starting Optimized MTI Telegram Scraper...")
-    scraped_data = scrape_moodle()
-    
-    if scraped_data["events"] or scraped_data["grades"]:
-        send_telegram_messages(scraped_data)
-    else:
-        print("No new events or grades found.")
+    try:
+        main()
+    except Exception as exc:
+        print(f"FATAL ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
