@@ -1,82 +1,73 @@
-# ============================================================
-#  MTI Telegram Bot — Scheduled Workflow
-# ============================================================
-#  Scrapes the MTI Moodle platform on a schedule and pushes
-#  new academic events / midterm grades to Telegram.
-#
-#  Triggers
-#  --------
-#  1. Manual dispatch  (workflow_dispatch)
-#  2. Cron fallback     every 2 hours at :17  (safety net when
-#     the primary external scheduler is unavailable)
-# ============================================================
-
-name: MTI Telegram Bot
+name: MTI Moodle Notifier
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "17 */2 * * *"
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
 
 permissions:
   contents: write
 
-concurrency:
-  group: mti-telegram-bot
-  cancel-in-progress: false
-
 jobs:
-  notify:
-    name: Scrape & Notify
+  check-moodle:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
-      # ----------------------------------------------------------
-      # 1. Checkout
-      # ----------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ----------------------------------------------------------
-      # 2. Python environment
-      # ----------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
 
       - name: Install dependencies
-        run: pip install --no-cache-dir requests beautifulsoup4 python-dotenv
-
-      # ----------------------------------------------------------
-      # 3. Run the notifier
-      # ----------------------------------------------------------
-      - name: Execute notifier
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          CHAT_ID:        ${{ secrets.CHAT_ID }}
-          UNI_USER:       ${{ secrets.UNI_USER }}
-          UNI_PASS:       ${{ secrets.UNI_PASS }}
-        run: python main.py
-
-      # ----------------------------------------------------------
-      # 4. Persist state files back to the repository
-      # ----------------------------------------------------------
-      - name: Commit updated state
-        if: always()
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
 
-          # Ensure state files exist so git-add never fails.
-          [ -f sent_events.json ] || echo "[]" > sent_events.json
-          [ -f sent_grades.json ] || echo "[]" > sent_grades.json
+      - name: Run Moodle bot with retry
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          retry_wait_seconds: 60
+          command: python moodle_bot.py
+        env:
+          MOODLE_URL: ${{ secrets.MOODLE_URL }}
+          MOODLE_USERNAME: ${{ secrets.MOODLE_USERNAME }}
+          MOODLE_PASSWORD: ${{ secrets.MOODLE_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
 
-          git add sent_events.json sent_grades.json
-
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: update notifier state [skip ci]"
-            git pull --rebase origin "${{ github.ref_name }}"
+      - name: Commit updated seen items
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: update seen Moodle items"
             git push
           fi
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -c '
+          import os, requests
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+          if token and chat_id:
+              msg = "⚠️ تنبيه: فشل تشغيل بوت MTI Moodle في GitHub Actions بعد عدة محاولات."
+              requests.post(
+                  f"https://api.telegram.org/bot{token}/sendMessage",
+                  json={"chat_id": chat_id, "text": msg},
+                  timeout=15,
+              )
+          '
