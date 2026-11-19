@@ -1,12 +1,17 @@
 """
 MTI E-Learning Notifier
 ~~~~~~~~~~~~~~~~~~~~~~~
-Monitors the MTI Moodle platform for upcoming events (from both the
-Dashboard 'Upcoming events' block and the Calendar API) and midterm grades,
+Monitors the MTI Moodle platform for upcoming events and midterm grades,
 then delivers formatted notifications to a Telegram chat.
 
+How events are sourced:
+- Fetches rich event details (description, exact timestamp, direct link)
+  from the Moodle Calendar AJAX API.
+- Cross-checks against the Dashboard 'Upcoming events' block so ONLY
+  events actively visible on the user's dashboard are dispatched.
+
 Notifications sent:
-1. Immediately when a new event appears in Upcoming Events.
+1. Immediately when a new visible upcoming event appears.
 2. First reminder when the deadline is within REMINDER_HOURS hours.
 3. Final reminder when the deadline is within FINAL_REMINDER_HOURS hour(s).
 """
@@ -22,7 +27,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -175,84 +179,51 @@ def authenticate(session: requests.Session) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Event scraping (Calendar API + Dashboard Upcoming Events block)
+# Event scraping (Calendar API verified against Dashboard Upcoming Events)
 # ---------------------------------------------------------------------------
 
 
-def _extract_course_map(dashboard_html: str) -> dict[str, str]:
-    """Map course IDs from dashboard links to full course names."""
-    soup = BeautifulSoup(dashboard_html, "html.parser")
-    courses: dict[str, str] = {}
-    for a in soup.select("a[href*='course/view.php?id=']"):
-        m = re.search(r"id=(\d+)", a.get("href", ""))
-        name = a.get_text(" ", strip=True)
-        if m and name:
-            courses[m.group(1)] = name
-    return courses
-
-
-def _parse_dashboard_upcoming_events(
+def extract_dashboard_event_filter(
     dashboard_html: str,
-    course_map: dict[str, str],
-) -> list[dict[str, Any]]:
+) -> tuple[set[str], set[str]]:
     """
-    Parse every event rendered inside the Dashboard 'Upcoming events' block
-    (section.block_calendar_upcoming), including 'opens' and 'closes' items.
+    Inspect the Dashboard 'Upcoming events' block (section.block_calendar_upcoming)
+    and return (visible_event_ids, visible_titles_lower) so Calendar API results
+    can be strictly verified against what is shown on the dashboard.
     """
     soup = BeautifulSoup(dashboard_html, "html.parser")
     block = soup.select_one("section.block_calendar_upcoming")
     if not block:
-        return []
+        log.warning("Dashboard 'Upcoming events' block not found.")
+        return set(), set()
 
-    events: list[dict[str, Any]] = []
+    visible_ids: set[str] = set()
+    visible_titles: set[str] = set()
+
     for item in block.select(".event"):
+        ev_id = item.get("data-event-id")
+        if ev_id:
+            visible_ids.add(str(ev_id).strip())
+
         link_el = item.select_one("a[href]")
-        if not link_el:
-            continue
+        if link_el:
+            title = link_el.get_text(" ", strip=True).lower()
+            if title:
+                visible_titles.add(title)
 
-        title = link_el.get_text(" ", strip=True)
-        href = link_el.get("href", "").strip()
-        if href.startswith("/"):
-            href = f"{MOODLE_BASE_URL}{href}"
+            href = link_el.get("href", "")
+            m_hash = re.search(r"#event_(\d+)", href)
+            if m_hash:
+                visible_ids.add(m_hash.group(1))
+            m_param = re.search(r"[?&]event=(\d+)", href)
+            if m_param:
+                visible_ids.add(m_param.group(1))
 
-        parsed = urlparse(href)
-        qs = parse_qs(parsed.query)
-
-        # Resolve event_id consistently so it merges cleanly with AJAX events
-        event_id = item.get("data-event-id") or (qs.get("event", [None])[0])
-        if not event_id:
-            mod_id = qs.get("id", [""])[0]
-            event_id = f"upcoming_{mod_id}_{title}" if mod_id else f"upcoming_{title}"
-        event_id = str(event_id)
-
-        course_id = item.get("data-course-id") or (qs.get("course", [None])[0])
-        course = course_map.get(str(course_id), "MTI E-Learning") if course_id else "MTI E-Learning"
-
-        date_el = item.select_one(".date")
-        deadline = date_el.get_text(" ", strip=True) if date_el else "Upcoming"
-
-        ts: int | None = None
-        if date_el:
-            time_link = date_el.select_one("a[href*='time=']")
-            if time_link:
-                m_ts = re.search(r"time=(\d+)", time_link.get("href", ""))
-                if m_ts:
-                    ts = int(m_ts.group(1))
-                    deadline = datetime.fromtimestamp(ts, tz=CAIRO_TZ).strftime(
-                        "%A, %d %b %Y  %I:%M %p"
-                    )
-
-        events.append({
-            "id":          event_id,
-            "title":       title,
-            "deadline":    deadline,
-            "timesort":    ts,
-            "link":        href,
-            "course":      course,
-            "description": "",
-        })
-
-    return events
+    log.info(
+        "Dashboard Upcoming Events block contains %d event(s).",
+        max(len(visible_ids), len(visible_titles)),
+    )
+    return visible_ids, visible_titles
 
 
 def fetch_all_moodle_events(
@@ -261,18 +232,21 @@ def fetch_all_moodle_events(
     dashboard_html: str,
 ) -> list[dict[str, Any]]:
     """
-    Combine events from both the Dashboard 'Upcoming events' block and
-    the Moodle calendar AJAX API so nothing in 'events' is missed.
+    Fetch rich event metadata from the Moodle Calendar AJAX API, keeping ONLY
+    events that are confirmed present in the Dashboard 'Upcoming events' block.
     """
-    now_ts = int(datetime.now(tz=CAIRO_TZ).timestamp())
+    visible_ids, visible_titles = extract_dashboard_event_filter(dashboard_html)
+    if not visible_ids and not visible_titles:
+        return []
+
     url = (
         f"{MOODLE_BASE_URL}/lib/ajax/service.php"
-        f"?sesskey={sesskey}&info=core_calendar_get_action_events_by_timesort"
+        f"?sesskey={sesskey}&info=core_calendar_get_calendar_upcoming_view"
     )
     payload: list[dict[str, Any]] = [{
         "index": 0,
-        "methodname": "core_calendar_get_action_events_by_timesort",
-        "args": {"limitnum": 50, "timesortfrom": now_ts},
+        "methodname": "core_calendar_get_calendar_upcoming_view",
+        "args": {},
     }]
 
     resp = session.post(url, json=payload, timeout=REQUEST_TIMEOUT)
@@ -282,11 +256,26 @@ def fetch_all_moodle_events(
     if not isinstance(data, list) or not data or data[0].get("error"):
         raise RuntimeError(f"Moodle AJAX error: {data}")
 
-    by_id: dict[str, dict[str, Any]] = {}
-    seen_signatures: set[tuple[str, str]] = set()
+    now_ts = int(datetime.now(tz=CAIRO_TZ).timestamp())
+    results: list[dict[str, Any]] = []
 
     for ev in data[0].get("data", {}).get("events", []):
-        title  = (ev.get("name") or "Untitled").strip()
+        ts = ev.get("timesort")
+        if ts and ts < now_ts:
+            continue
+
+        title    = (ev.get("name") or "Untitled").strip()
+        event_id = str(ev.get("id") or "")
+
+        # Must exist in the Dashboard 'Upcoming events' block
+        in_dashboard = (
+            (event_id and event_id in visible_ids)
+            or (title.lower() in visible_titles)
+        )
+        if not in_dashboard:
+            log.info("Skipping event not shown on dashboard: %s", title)
+            continue
+
         link   = ev.get("url") or f"{MOODLE_BASE_URL}/my/"
         course = (ev.get("course", {}).get("fullname") or "Unknown Course").strip()
 
@@ -296,35 +285,22 @@ def fetch_all_moodle_events(
             if raw_desc else ""
         )
 
-        ts       = ev.get("timesort")
         deadline = (
             datetime.fromtimestamp(ts, tz=CAIRO_TZ).strftime("%A, %d %b %Y  %I:%M %p")
             if ts else "Unknown"
         )
 
-        event_id = str(ev.get("id") or f"{title}_{deadline}")
-        by_id[event_id] = {
-            "id":          event_id,
+        results.append({
+            "id":          event_id or f"{title}_{deadline}",
             "title":       title,
             "deadline":    deadline,
             "timesort":    ts,
             "link":        link,
             "course":      course,
             "description": description,
-        }
-        seen_signatures.add((title.lower(), link))
+        })
 
-    # Merge any extra items visible in the Dashboard 'Upcoming events' block
-    course_map = _extract_course_map(dashboard_html)
-    for dash_ev in _parse_dashboard_upcoming_events(dashboard_html, course_map):
-        sig = (dash_ev["title"].lower(), dash_ev["link"])
-        if dash_ev["id"] in by_id or sig in seen_signatures:
-            continue
-        by_id[dash_ev["id"]] = dash_ev
-        seen_signatures.add(sig)
-
-    results = list(by_id.values())
-    log.info("Collected %d total event(s) from Moodle.", len(results))
+    log.info("Verified %d calendar event(s) against dashboard.", len(results))
     return results
 
 
@@ -332,7 +308,7 @@ def filter_new_events(
     all_events: list[dict[str, Any]],
     sent_ids: list[str],
 ) -> list[dict[str, Any]]:
-    """Return events that have not been notified yet."""
+    """Return verified dashboard events that have not been notified yet."""
     seen = set(sent_ids)
     new  = [ev for ev in all_events if ev["id"] not in seen]
     log.info("Found %d new event(s).", len(new))
@@ -395,7 +371,15 @@ def fetch_grades(
 ) -> list[dict[str, str]]:
     """Return courses with newly published midterm grades."""
 
-    courses  = _extract_course_map(dashboard_html)
+    soup    = BeautifulSoup(dashboard_html, "html.parser")
+    courses = {}
+
+    for a in soup.select("a[href*='course/view.php?id=']"):
+        m    = re.search(r"id=(\d+)", a.get("href", ""))
+        name = a.get_text(" ", strip=True)
+        if m and name:
+            courses[m.group(1)] = name
+
     sent_set = set(sent_ids)
     results  = []
 
