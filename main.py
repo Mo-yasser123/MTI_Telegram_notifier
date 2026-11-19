@@ -1,315 +1,239 @@
-import os
-import sys
-import json
-import re
+"""
+MTI E-Learning Notifier
+~~~~~~~~~~~~~~~~~~~~~~~
+Scrapes the MTI Moodle platform for upcoming academic events,
+6-hour deadline reminders, and newly published midterm grades,
+then delivers real-time notifications to a designated Telegram chat.
+
+Designed to run as a scheduled GitHub Actions workflow or via any
+external cron trigger (e.g. cron-job.org).
+"""
+
+from __future__ import annotations
+
 import html
+import json
+import logging
+import os
+import re
+import sys
 from datetime import datetime
+from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
+
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-UNI_USER = os.getenv("UNI_USER")
-UNI_PASS = os.getenv("UNI_PASS")
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
-BASE_URL = "https://elearning-01.mti.edu.eg"
-EVENTS_FILE = os.path.join(BASE_DIR, "sent_events.json")
-GRADES_FILE = os.path.join(BASE_DIR, "sent_grades.json")
+TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
+CHAT_ID: str = os.getenv("CHAT_ID", "")
+UNI_USER: str = os.getenv("UNI_USER", "")
+UNI_PASS: str = os.getenv("UNI_PASS", "")
+
+MOODLE_BASE_URL = "https://elearning-01.mti.edu.eg"
+EVENTS_FILE = BASE_DIR / "sent_events.json"
+GRADES_FILE = BASE_DIR / "sent_grades.json"
 CAIRO_TZ = ZoneInfo("Africa/Cairo")
-MAX_SAVED = 500
-REQUEST_TIMEOUT = 25
+MAX_PERSISTED_IDS = 500
+REQUEST_TIMEOUT = 25  # seconds
+REMINDER_HOURS = 6
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("mti_notifier")
+
+# ---------------------------------------------------------------------------
+# Professor mapping
+# ---------------------------------------------------------------------------
+
+_PROFESSOR_MAP: list[tuple[str, str]] = [
+    ("english language", "Dr. Rasha Saeed"),
+    ("introduction to programming", "Dr. Hafez M.S. Abdel-Wahab"),
+    ("introduction to computer science", "Dr. Mohamed M. Elgazzar"),
+    ("linear algebra", "Walid Basiony"),
+    ("mathematical analysis", "Dr. Rania Ahmed"),
+    ("entrepreneur", "Dr. El-Sayed Orabi"),
+]
 
 
-# ==========================================
-# أدوات مساعدة
-# ==========================================
-def get_professor_name(course_name):
-    name_lower = course_name.lower()
-    if "english language" in name_lower:
-        return "Dr. Rasha Saeed"
-    elif "introduction to programming" in name_lower:
-        return "Dr. HAFEZ M.S. ABDEL-WAHAB"
-    elif "introduction to computer science" in name_lower:
-        return "Dr. Mohamed M. Elgazzar"
-    elif "linear algebra" in name_lower:
-        return "Walid Basiony"
-    elif "mathematical analysis" in name_lower:
-        return "Dr. Rania Ahmed"
-    elif "entrepreneur" in name_lower:
-        return "Dr. El-sayed Orabi"
-    return "Not Specified"
+def resolve_professor(course_name: str) -> str:
+    """Return the professor associated with *course_name*, if known."""
+    lowered = course_name.lower()
+    for keyword, professor in _PROFESSOR_MAP:
+        if keyword in lowered:
+            return professor
+    return "N/A"
 
 
-def load_json(filename):
+# ---------------------------------------------------------------------------
+# Persistence helpers
+# ---------------------------------------------------------------------------
+
+
+def load_id_list(path: Path) -> list[str]:
+    """Load a JSON list of string IDs from *path*."""
     try:
-        with open(filename, "r", encoding="utf-8-sig") as f:
-            data = json.load(f)
+        with path.open("r", encoding="utf-8-sig") as fh:
+            data = json.load(fh)
             return data if isinstance(data, list) else []
     except (FileNotFoundError, json.JSONDecodeError):
         return []
 
 
-def save_json(filename, data):
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(data[-MAX_SAVED:], f, ensure_ascii=False, indent=4)
+def save_id_list(path: Path, ids: list[str]) -> None:
+    """Persist the most recent *MAX_PERSISTED_IDS* entries to *path*."""
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(ids[-MAX_PERSISTED_IDS:], fh, ensure_ascii=False, indent=2)
 
 
-def build_session():
+# ---------------------------------------------------------------------------
+# HTTP session factory
+# ---------------------------------------------------------------------------
+
+
+def create_session() -> requests.Session:
+    """Build a ``requests.Session`` with sensible retry behaviour."""
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/130.0.0.0 Safari/537.36"
-        )
-    })
-    retry_strategy = Retry(
+    session.headers["User-Agent"] = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/130.0.0.0 Safari/537.36"
+    )
+    retry = Retry(
         total=3,
         backoff_factor=1.5,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "POST"],
     )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
+    adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
 
 
-# ==========================================
-# تسجيل الدخول والسحب من Moodle
-# ==========================================
-def login_moodle(session):
-    login_url = f"{BASE_URL}/login/index.php"
-    resp = session.get(login_url, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
+# ---------------------------------------------------------------------------
+# Moodle authentication
+# ---------------------------------------------------------------------------
 
-    token_match = re.search(r'name="logintoken"\s+value="([^"]+)"', resp.text)
+
+def authenticate(session: requests.Session) -> tuple[str, str]:
+    """
+    Log in to Moodle and return *(dashboard_html, sesskey)*.
+
+    Raises ``RuntimeError`` on failure.
+    """
+    login_url = f"{MOODLE_BASE_URL}/login/index.php"
+
+    # Fetch the login page to obtain the CSRF token.
+    page = session.get(login_url, timeout=REQUEST_TIMEOUT)
+    page.raise_for_status()
+
+    token_match = re.search(r'name="logintoken"\s+value="([^"]+)"', page.text)
     if not token_match:
-        raise RuntimeError("Could not find logintoken on Moodle login page.")
+        raise RuntimeError("Login token not found on the Moodle login page.")
 
-    payload = {
-        "username": UNI_USER,
-        "password": UNI_PASS,
-        "logintoken": token_match.group(1),
-    }
-    post_resp = session.post(login_url, data=payload, timeout=REQUEST_TIMEOUT)
-    post_resp.raise_for_status()
-
-    if "login/index.php" in post_resp.url:
-        raise RuntimeError("Moodle login failed. Check UNI_USER and UNI_PASS.")
-
-    dash_resp = session.get(f"{BASE_URL}/my/", timeout=REQUEST_TIMEOUT)
-    dash_resp.raise_for_status()
-
-    sesskey_match = re.search(r'"sesskey"\s*:\s*"([^"]+)"', dash_resp.text)
-    if not sesskey_match:
-        raise RuntimeError("Could not extract sesskey from Moodle dashboard.")
-
-    return dash_resp.text, sesskey_match.group(1)
-
-
-def scrape_events(session, sesskey, saved_events):
-    new_events = []
-    ajax_url = (
-        f"{BASE_URL}/lib/ajax/service.php"
-        f"?sesskey={sesskey}&info=core_calendar_get_action_events_by_timesort"
+    # Submit credentials.
+    response = session.post(
+        login_url,
+        data={
+            "username": UNI_USER,
+            "password": UNI_PASS,
+            "logintoken": token_match.group(1),
+        },
+        timeout=REQUEST_TIMEOUT,
     )
-    ajax_payload = [{
-        "index": 0,
-        "methodname": "core_calendar_get_action_events_by_timesort",
-        "args": {"limitnum": 20, "timesortfrom": 0},
-    }]
+    response.raise_for_status()
 
-    resp = session.post(ajax_url, json=ajax_payload, timeout=REQUEST_TIMEOUT)
+    if "login/index.php" in response.url:
+        raise RuntimeError(
+            "Moodle authentication failed — verify UNI_USER and UNI_PASS."
+        )
+
+    # Load the dashboard to extract the session key.
+    dashboard = session.get(f"{MOODLE_BASE_URL}/my/", timeout=REQUEST_TIMEOUT)
+    dashboard.raise_for_status()
+
+    sesskey_match = re.search(r'"sesskey"\s*:\s*"([^"]+)"', dashboard.text)
+    if not sesskey_match:
+        raise RuntimeError("Session key not found on the Moodle dashboard.")
+
+    logger.info("Moodle authentication successful.")
+    return dashboard.text, sesskey_match.group(1)
+
+
+# ---------------------------------------------------------------------------
+# Event scraping & 6-hour deadline reminders
+# ---------------------------------------------------------------------------
+
+
+def fetch_events(
+    session: requests.Session,
+    sesskey: str,
+    already_sent: list[str],
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Return *(new_events, reminder_events)* from the Moodle calendar."""
+
+    ajax_url = (
+        f"{MOODLE_BASE_URL}/lib/ajax/service.php"
+        f"?sesskey={sesskey}"
+        f"&info=core_calendar_get_action_events_by_timesort"
+    )
+    payload = [
+        {
+            "index": 0,
+            "methodname": "core_calendar_get_action_events_by_timesort",
+            "args": {"limitnum": 26, "timesortfrom": 0},
+        }
+    ]
+
+    resp = session.post(ajax_url, json=payload, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
-    data = resp.json()
+    data: list[dict[str, Any]] = resp.json()
 
     if not isinstance(data, list) or not data or data[0].get("error"):
-        raise RuntimeError(f"Moodle AJAX error: {data}")
+        raise RuntimeError(f"Moodle AJAX returned an error: {data}")
 
-    events_list = data[0].get("data", {}).get("events", [])
-    seen_now = set()
+    raw_events: list[dict[str, Any]] = (
+        data[0].get("data", {}).get("events", [])
+    )
 
-    for event in events_list:
-        raw_title = (event.get("name") or "No Title").strip()
-        event_link = event.get("url") or f"{BASE_URL}/my/"
-        course_name = (event.get("course", {}).get("fullname") or "Unknown Course").strip()
+    seen: set[str] = set(already_sent)
+    now_ts = datetime.now(tz=CAIRO_TZ).timestamp()
+    reminder_window = REMINDER_HOURS * 3600
 
-        raw_desc = event.get("description") or ""
-        description = BeautifulSoup(raw_desc, "html.parser").get_text(" ", strip=True) if raw_desc else ""
+    new_events: list[dict[str, str]] = []
+    reminder_events: list[dict[str, str]] = []
 
-        time_sort = event.get("timesort")
-        if time_sort:
-            date_time = datetime.fromtimestamp(time_sort, tz=CAIRO_TZ).strftime("%Y-%m-%d %I:%M %p")
-        else:
-            date_time = "Unknown Time"
+    for ev in raw_events:
+        title = (ev.get("name") or "Untitled").strip()
+        link = ev.get("url") or f"{MOODLE_BASE_URL}/my/"
+        course = (
+            ev.get("course", {}).get("fullname") or "Unknown Course"
+        ).strip()
 
-        event_id = str(event.get("id") or f"{raw_title}_{date_time}")
+        raw_desc = ev.get("description") or ""
+        description = (
+            BeautifulSoup(raw_desc, "html.parser").get_text(" ", strip=True)
+            if raw_desc
+            else ""
+        )
 
-        if event_id in saved_events or event_id in seen_now:
-            continue
-        seen_now.add(event_id)
-
-        new_events.append({
-            "id": event_id,
-            "raw_title": raw_title,
-            "date": date_time,
-            "link": event_link,
-            "course_name": course_name,
-            "description": description,
-        })
-
-    return new_events
-
-
-def scrape_grades(session, dash_html, saved_grades):
-    new_grades = []
-    soup = BeautifulSoup(dash_html, "html.parser")
-
-    courses = {}
-    for link in soup.select("a[href*='course/view.php?id=']"):
-        href = link.get("href", "")
-        name = link.get_text(" ", strip=True)
-        match = re.search(r"id=(\d+)", href)
-        if match and name:
-            courses[match.group(1)] = name
-
-    keywords = ["mid", "mt", "ميد"]
-
-    for c_id, c_name in courses.items():
-        grade_id = f"{c_id}_midterm"
-        if grade_id in saved_grades:
-            continue
-
-        grade_url = f"{BASE_URL}/grade/report/user/index.php?id={c_id}"
-        try:
-            resp = session.get(grade_url, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            grade_soup = BeautifulSoup(resp.text, "html.parser")
-
-            for row in grade_soup.find_all("tr"):
-                row_text = row.get_text(" ", strip=True).lower()
-                if any(kw in row_text for kw in keywords):
-                    grade_cell = row.select_one("[class*='column-grade']")
-                    if not grade_cell:
-                        continue
-                    grade_val = grade_cell.get_text(strip=True)
-                    if grade_val and grade_val not in ("-", "—", ""):
-                        new_grades.append({
-                            "id": grade_id,
-                            "course_name": c_name,
-                            "link": grade_url,
-                        })
-                        break
-        except Exception as e:
-            print(f"Warning: Could not check grades for {c_name}: {e}")
-
-    return new_grades
-
-
-# ==========================================
-# تليجرام
-# ==========================================
-def send_to_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    try:
-        response = requests.post(url, json=payload, timeout=20)
-        if response.status_code == 200 and response.json().get("ok"):
-            print("Message sent successfully.")
-            return True
-        print(f"Telegram failed: {response.text}")
-    except Exception as e:
-        print(f"Telegram API error: {e}")
-    return False
-
-
-def build_event_message(event):
-    raw_title = event["raw_title"]
-    task_name = raw_title.replace(" is due", "").strip()
-    course_name = event["course_name"]
-    professor = get_professor_name(course_name)
-
-    safe_course = html.escape(course_name)
-    safe_prof = html.escape(professor)
-    safe_task = html.escape(task_name)
-    safe_date = html.escape(event["date"])
-    safe_link = html.escape(event["link"], quote=True)
-
-    message = "🚨 <b>New Academic Update</b>\n\n"
-    message += f"📚 <b>Course:</b> <code>{safe_course}</code>\n"
-    message += f"👨‍🏫 <b>Professor:</b> {safe_prof}\n"
-    message += f"📝 <b>Task:</b> {safe_task}\n"
-    message += f"⏳ <b>Deadline:</b> {safe_date}\n"
-
-    if event.get("description"):
-        desc = event["description"]
-        if len(desc) > 120:
-            desc = desc[:117] + "..."
-        message += f"ℹ️ <b>Details:</b> <i>{html.escape(desc)}</i>\n"
-
-    message += f"\n🔗 <a href='{safe_link}'><b>Click here to view details</b></a>"
-    return message
-
-
-def build_grade_message(grade):
-    safe_course = html.escape(grade["course_name"])
-    safe_link = html.escape(grade["link"], quote=True)
-
-    message = " <b>منورين يا شباب...</b>\n\n"
-    message += f"📊 <b>درجة امتحان</b> <code>{safe_course}</code> <b>نزلت.</b>\n\n"
-    message += f"🔗 <a href='{safe_link}'><b>اضغط هنا لمعرفة النتيجة</b></a>"
-    return message
-
-
-# ==========================================
-# التشغيل الرئيسي
-# ==========================================
-def main():
-    print("Starting MTI Telegram Scraper (Requests + BS4)...")
-
-    if not all([TELEGRAM_TOKEN, CHAT_ID, UNI_USER, UNI_PASS]):
-        raise SystemExit("Missing env vars: TELEGRAM_TOKEN, CHAT_ID, UNI_USER, UNI_PASS")
-
-    saved_events = load_json(EVENTS_FILE)
-    saved_grades = load_json(GRADES_FILE)
-
-    session = build_session()
-    dash_html, sesskey = login_moodle(session)
-
-    new_events = scrape_events(session, sesskey, saved_events)
-    new_grades = scrape_grades(session, dash_html, saved_grades)
-
-    if not new_events and not new_grades:
-        print("No new events or grades found.")
-        return
-
-    for event in new_events:
-        if send_to_telegram(build_event_message(event)):
-            saved_events.append(event["id"])
-            save_json(EVENTS_FILE, saved_events)
-
-    for grade in new_grades:
-        if send_to_telegram(build_grade_message(grade)):
-            saved_grades.append(grade["id"])
-            save_json(GRADES_FILE, saved_grades)
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        print(f"FATAL ERROR: {exc}", file=sys.stderr)
-        sys.exit(1)
+        timesort = ev.get
