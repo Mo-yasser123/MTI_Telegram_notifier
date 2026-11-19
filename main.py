@@ -7,7 +7,7 @@ then delivers formatted notifications to a Telegram chat.
 Notifications sent:
 1. Immediately when a new assignment is open for submission (or a new quiz appears).
 2. First reminder when the deadline is within REMINDER_HOURS hours.
-3. Final reminder when the deadline is within FINAL_REMINDER_HOURS hours.
+3. Final reminder when the deadline is within FINAL_REMINDER_HOURS hour(s).
 
 Runs on GitHub Actions (triggered by cron-job.org or the built-in fallback
 schedule). State is persisted as JSON files committed back to the repository.
@@ -52,7 +52,7 @@ CAIRO_TZ             = ZoneInfo("Africa/Cairo")
 MAX_PERSISTED_IDS    = 500
 REQUEST_TIMEOUT      = 25  # seconds
 REMINDER_HOURS       = 6   # first reminder before the deadline
-FINAL_REMINDER_HOURS = 2   # final reminder before the deadline
+FINAL_REMINDER_HOURS = 1   # final reminder before the deadline
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -301,7 +301,6 @@ def filter_reminder_events(
         ts = ev.get("timesort")
         if not ts or not (now_ts < ts <= first_cutoff_ts):
             continue
-        # Only remind for events that were already opened and notified in a prior run.
         if ev["id"] not in known_open_ids:
             continue
 
@@ -466,9 +465,10 @@ def build_final_reminder_message(event: dict[str, Any]) -> str:
     task       = event["title"].replace(" is due", "").strip()
     instructor = resolve_instructor(event["course"])
     e          = html.escape
+    unit       = "HOUR" if FINAL_REMINDER_HOURS == 1 else "HOURS"
 
     parts = [
-        f"<b>FINAL REMINDER  --  LESS THAN {FINAL_REMINDER_HOURS} HOURS LEFT</b>",
+        f"<b>FINAL REMINDER  --  LESS THAN {FINAL_REMINDER_HOURS} {unit} LEFT</b>",
         _DIVIDER,
         f"<b>Course</b>      {e(event['course'])}",
         f"<b>Instructor</b>  {e(instructor)}",
