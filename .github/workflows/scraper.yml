@@ -1,10 +1,22 @@
+# ============================================================
+#  MTI Telegram Bot — Scheduled Workflow
+# ============================================================
+#  Scrapes the MTI Moodle platform on a schedule and pushes
+#  new academic events / midterm grades to Telegram.
+#
+#  Triggers
+#  --------
+#  1. Manual dispatch  (workflow_dispatch)
+#  2. Cron fallback     every 2 hours at :17  (safety net when
+#     the primary external scheduler is unavailable)
+# ============================================================
+
 name: MTI Telegram Bot
 
 on:
   workflow_dispatch:
   schedule:
-    # شبكة أمان احتياطية كل ساعتين لو cron-job.org وقع مؤقتاً
-    - cron: '17 */2 * * *'
+    - cron: "17 */2 * * *"
 
 permissions:
   contents: write
@@ -14,43 +26,57 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  run-bot:
+  notify:
+    name: Scrape & Notify
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
     steps:
+      # ----------------------------------------------------------
+      # 1. Checkout
+      # ----------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ----------------------------------------------------------
+      # 2. Python environment
+      # ----------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4 python-dotenv
+        run: pip install --no-cache-dir requests beautifulsoup4 python-dotenv
 
-      - name: Run MTI Bot
+      # ----------------------------------------------------------
+      # 3. Run the notifier
+      # ----------------------------------------------------------
+      - name: Execute notifier
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-          UNI_USER: ${{ secrets.UNI_USER }}
-          UNI_PASS: ${{ secrets.UNI_PASS }}
+          CHAT_ID:        ${{ secrets.CHAT_ID }}
+          UNI_USER:       ${{ secrets.UNI_USER }}
+          UNI_PASS:       ${{ secrets.UNI_PASS }}
         run: python main.py
 
-      - name: Save bot memory
+      # ----------------------------------------------------------
+      # 4. Persist state files back to the repository
+      # ----------------------------------------------------------
+      - name: Commit updated state
         if: always()
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # Ensure state files exist so git-add never fails.
           [ -f sent_events.json ] || echo "[]" > sent_events.json
           [ -f sent_grades.json ] || echo "[]" > sent_grades.json
 
           git add sent_events.json sent_grades.json
 
           if ! git diff --cached --quiet; then
-            git commit -m "Update bot memory [skip ci]"
+            git commit -m "chore: update notifier state [skip ci]"
             git pull --rebase origin "${{ github.ref_name }}"
             git push
           fi
