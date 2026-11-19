@@ -5,8 +5,9 @@ Monitors the MTI Moodle platform for new assignments and midterm grades,
 then delivers formatted notifications to a Telegram chat.
 
 Notifications sent:
-  1. Immediately when a new assignment / deadline appears.
-  2. Again as a reminder when the deadline is within REMINDER_HOURS hours.
+1. Immediately when a new assignment / deadline appears.
+2. First reminder when the deadline is within REMINDER_HOURS hours.
+3. Final reminder when the deadline is within FINAL_REMINDER_HOURS hours.
 
 Runs on GitHub Actions (triggered by cron-job.org or the built-in fallback
 schedule). State is persisted as JSON files committed back to the repository.
@@ -43,14 +44,15 @@ CHAT_ID: str        = os.getenv("CHAT_ID", "")
 UNI_USER: str       = os.getenv("UNI_USER", "")
 UNI_PASS: str       = os.getenv("UNI_PASS", "")
 
-MOODLE_BASE_URL   = "https://elearning-01.mti.edu.eg"
-EVENTS_FILE       = BASE_DIR / "sent_events.json"
-GRADES_FILE       = BASE_DIR / "sent_grades.json"
-REMINDERS_FILE    = BASE_DIR / "sent_reminders.json"
-CAIRO_TZ          = ZoneInfo("Africa/Cairo")
-MAX_PERSISTED_IDS = 500
-REQUEST_TIMEOUT   = 25   # seconds
-REMINDER_HOURS    = 6    # send a reminder this many hours before the deadline
+MOODLE_BASE_URL      = "https://elearning-01.mti.edu.eg"
+EVENTS_FILE          = BASE_DIR / "sent_events.json"
+GRADES_FILE          = BASE_DIR / "sent_grades.json"
+REMINDERS_FILE       = BASE_DIR / "sent_reminders.json"
+CAIRO_TZ             = ZoneInfo("Africa/Cairo")
+MAX_PERSISTED_IDS    = 500
+REQUEST_TIMEOUT      = 25  # seconds
+REMINDER_HOURS       = 6   # first reminder before the deadline
+FINAL_REMINDER_HOURS = 2   # final reminder before the deadline
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -150,8 +152,11 @@ def authenticate(session: requests.Session) -> tuple[str, str]:
 
     resp = session.post(
         login_url,
-        data={"username": UNI_USER, "password": UNI_PASS,
-              "logintoken": token.group(1)},
+        data={
+            "username": UNI_USER,
+            "password": UNI_PASS,
+            "logintoken": token.group(1),
+        },
         timeout=REQUEST_TIMEOUT,
     )
     resp.raise_for_status()
@@ -171,7 +176,7 @@ def authenticate(session: requests.Session) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Event scraping
+# Event scraping & reminders
 # ---------------------------------------------------------------------------
 
 
@@ -180,10 +185,10 @@ def fetch_all_moodle_events(
     sesskey: str,
 ) -> list[dict[str, Any]]:
     """
-    Fetch all upcoming events from the Moodle calendar AJAX API.
-    Returns enriched dicts that include the raw Unix timestamp (timesort)
-    so the reminder logic can compare it against the current time.
+    Fetch upcoming events from the Moodle calendar AJAX API
+    starting from the current timestamp (ignores expired tasks).
     """
+    now_ts = int(datetime.now(tz=CAIRO_TZ).timestamp())
     url = (
         f"{MOODLE_BASE_URL}/lib/ajax/service.php"
         f"?sesskey={sesskey}&info=core_calendar_get_action_events_by_timesort"
@@ -191,7 +196,7 @@ def fetch_all_moodle_events(
     payload: list[dict[str, Any]] = [{
         "index": 0,
         "methodname": "core_calendar_get_action_events_by_timesort",
-        "args": {"limitnum": 26, "timesortfrom": 0},
+        "args": {"limitnum": 26, "timesortfrom": now_ts},
     }]
 
     resp = session.post(url, json=payload, timeout=REQUEST_TIMEOUT)
@@ -249,30 +254,50 @@ def filter_new_events(
 def filter_reminder_events(
     all_events: list[dict[str, Any]],
     sent_reminder_ids: list[str],
-) -> list[dict[str, Any]]:
+    skip_event_ids: set[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """
-    Return events whose deadline is within the next REMINDER_HOURS hours
-    and for which a reminder has not been sent yet.
+    Return (first_reminders, final_reminders) for events approaching their deadline.
+    Skips events already being sent as brand-new in the same run.
     """
     now_ts           = datetime.now(tz=CAIRO_TZ).timestamp()
-    cutoff_ts        = now_ts + REMINDER_HOURS * 3600
+    first_cutoff_ts  = now_ts + REMINDER_HOURS * 3600
+    final_cutoff_ts  = now_ts + FINAL_REMINDER_HOURS * 3600
     already_reminded = set(sent_reminder_ids)
 
-    due_soon = [
-        ev for ev in all_events
-        if ev["timesort"]
-        and now_ts < ev["timesort"] <= cutoff_ts
-        and ev["id"] not in already_reminded
-    ]
-    log.info("Found %d event(s) due within %d hours.", len(due_soon), REMINDER_HOURS)
-    return due_soon
+    first_reminders: list[dict[str, Any]] = []
+    final_reminders: list[dict[str, Any]] = []
+
+    for ev in all_events:
+        ts = ev.get("timesort")
+        if not ts or not (now_ts < ts <= first_cutoff_ts):
+            continue
+        if ev["id"] in skip_event_ids:
+            continue
+
+        final_key = f"{ev['id']}_final"
+        first_key = f"{ev['id']}_{REMINDER_HOURS}h"
+
+        if ts <= final_cutoff_ts:
+            if final_key not in already_reminded:
+                final_reminders.append({**ev, "reminder_key": final_key})
+        else:
+            if first_key not in already_reminded and ev["id"] not in already_reminded:
+                first_reminders.append({**ev, "reminder_key": first_key})
+
+    log.info(
+        "Found %d first reminder(s) and %d final reminder(s).",
+        len(first_reminders),
+        len(final_reminders),
+    )
+    return first_reminders, final_reminders
 
 
 # ---------------------------------------------------------------------------
 # Grade scraping
 # ---------------------------------------------------------------------------
 
-_MIDTERM_KEYWORDS = ["mid", "mt", "\u0645\u064a\u062f"]
+_MIDTERM_KEYWORDS = ["mid", "mt", "ميد"]
 
 
 def fetch_grades(
@@ -313,7 +338,7 @@ def fetch_grades(
                 if not cell:
                     continue
                 val = cell.get_text(strip=True)
-                if val and val not in ("-", "\u2014", ""):
+                if val and val not in ("-", "—", ""):
                     results.append({"id": gid, "course": cname, "link": grade_url})
                     break
         except Exception:
@@ -333,8 +358,12 @@ def send_message(text: str) -> bool:
     try:
         r = requests.post(
             endpoint,
-            json={"chat_id": CHAT_ID, "text": text,
-                  "parse_mode": "HTML", "disable_web_page_preview": True},
+            json={
+                "chat_id": CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
             timeout=20,
         )
         if r.status_code == 200 and r.json().get("ok"):
@@ -350,7 +379,7 @@ def send_message(text: str) -> bool:
 # Message templates
 # ---------------------------------------------------------------------------
 
-_DIVIDER = "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+_DIVIDER = "────────────────────"
 
 
 def build_event_message(event: dict[str, Any]) -> str:
@@ -382,7 +411,7 @@ def build_event_message(event: dict[str, Any]) -> str:
 
 
 def build_reminder_message(event: dict[str, Any]) -> str:
-    """6-hour reminder -- distinct header so it is immediately recognisable."""
+    """First reminder -- 6 hours before the deadline."""
     task       = event["title"].replace(" is due", "").strip()
     instructor = resolve_instructor(event["course"])
     e          = html.escape
@@ -395,7 +424,28 @@ def build_reminder_message(event: dict[str, Any]) -> str:
         f"<b>Task</b>        {e(task)}",
         f"<b>Deadline</b>    {e(event['deadline'])}",
         "",
-        "\u0627\u0644\u0645\u0647\u0645\u0629 \u062f\u064a \u0647\u062a\u0646\u062a\u0647\u064a \u062e\u0644\u0627\u0644 6 \u0633\u0627\u0639\u0627\u062a \u2014 \u0627\u062a\u0623\u0643\u062f \u0625\u0646\u0643 \u0633\u0644\u0645\u062a.",
+        f"المهمة دي هتنتهي خلال {REMINDER_HOURS} ساعات — اتأكد إنك سلمت.",
+        _DIVIDER,
+        f"<a href='{e(event['link'], quote=True)}'><b>Open in Moodle</b></a>",
+    ]
+    return "\n".join(parts)
+
+
+def build_final_reminder_message(event: dict[str, Any]) -> str:
+    """Final reminder -- right before the deadline closes."""
+    task       = event["title"].replace(" is due", "").strip()
+    instructor = resolve_instructor(event["course"])
+    e          = html.escape
+
+    parts = [
+        f"<b>FINAL REMINDER  --  LESS THAN {FINAL_REMINDER_HOURS} HOURS LEFT</b>",
+        _DIVIDER,
+        f"<b>Course</b>      {e(event['course'])}",
+        f"<b>Instructor</b>  {e(instructor)}",
+        f"<b>Task</b>        {e(task)}",
+        f"<b>Deadline</b>    {e(event['deadline'])}",
+        "",
+        "تنبيه أخير: الموعد قرب يقفل — سلّم دلوقتي قبل ما الوقت يخلص.",
         _DIVIDER,
         f"<a href='{e(event['link'], quote=True)}'><b>Open in Moodle</b></a>",
     ]
@@ -407,9 +457,9 @@ def build_grade_message(grade: dict[str, str]) -> str:
     parts = [
         "<b>GRADE PUBLISHED</b>",
         _DIVIDER,
-        f"\u062f\u0631\u062c\u0629 \u0627\u0644\u0645\u064a\u062f \u062a\u064a\u0631\u0645 \u0628\u062a\u0627\u0639\u062a <b>{e(grade['course'])}</b> \u0646\u0632\u0644\u062a.",
+        f"درجة الميد تيرم بتاعت <b>{e(grade['course'])}</b> نزلت.",
         "",
-        f"<a href='{e(grade['link'], quote=True)}'><b>\u0627\u0639\u0631\u0641 \u0646\u062a\u064a\u062c\u062a\u0643</b></a>",
+        f"<a href='{e(grade['link'], quote=True)}'><b>اعرف نتيجتك</b></a>",
     ]
     return "\n".join(parts)
 
@@ -438,10 +488,14 @@ def main() -> None:
 
     all_events = fetch_all_moodle_events(session, key)
     new_events = filter_new_events(all_events, sent_events)
-    due_soon   = filter_reminder_events(all_events, sent_reminders)
+    new_ids    = {ev["id"] for ev in new_events}
+
+    first_reminders, final_reminders = filter_reminder_events(
+        all_events, sent_reminders, skip_event_ids=new_ids
+    )
     new_grades = fetch_grades(session, dash_html, sent_grades)
 
-    if not new_events and not due_soon and not new_grades:
+    if not new_events and not first_reminders and not final_reminders and not new_grades:
         log.info("Nothing new -- exiting.")
         return
 
@@ -450,9 +504,14 @@ def main() -> None:
             sent_events.append(ev["id"])
             save_ids(EVENTS_FILE, sent_events)
 
-    for ev in due_soon:
+    for ev in first_reminders:
         if send_message(build_reminder_message(ev)):
-            sent_reminders.append(ev["id"])
+            sent_reminders.append(ev["reminder_key"])
+            save_ids(REMINDERS_FILE, sent_reminders)
+
+    for ev in final_reminders:
+        if send_message(build_final_reminder_message(ev)):
+            sent_reminders.append(ev["reminder_key"])
             save_ids(REMINDERS_FILE, sent_reminders)
 
     for gr in new_grades:
@@ -461,8 +520,8 @@ def main() -> None:
             save_ids(GRADES_FILE, sent_grades)
 
     log.info(
-        "Done -- %d new event(s), %d reminder(s), %d grade(s) sent.",
-        len(new_events), len(due_soon), len(new_grades),
+        "Done -- %d new event(s), %d first reminder(s), %d final reminder(s), %d grade(s) sent.",
+        len(new_events), len(first_reminders), len(final_reminders), len(new_grades),
     )
 
 
