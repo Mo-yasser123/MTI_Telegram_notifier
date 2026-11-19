@@ -1,11 +1,11 @@
 """
 MTI E-Learning Notifier
 ~~~~~~~~~~~~~~~~~~~~~~~
-Monitors the MTI Moodle platform for new assignments and midterm grades,
+Monitors the MTI Moodle platform for open assignments and midterm grades,
 then delivers formatted notifications to a Telegram chat.
 
 Notifications sent:
-1. Immediately when a new assignment / deadline appears.
+1. Immediately when a new assignment is open for submission (or a new quiz appears).
 2. First reminder when the deadline is within REMINDER_HOURS hours.
 3. Final reminder when the deadline is within FINAL_REMINDER_HOURS hours.
 
@@ -176,8 +176,26 @@ def authenticate(session: requests.Session) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Event scraping & reminders
+# Event scraping & submission status check
 # ---------------------------------------------------------------------------
+
+
+def is_submission_open(session: requests.Session, url: str) -> bool:
+    """
+    Check if a Moodle assignment has the 'Add submission' button enabled.
+    Non-assignment events (e.g. quizzes) pass through immediately.
+    """
+    if "/mod/assign/" not in url:
+        return True
+
+    try:
+        resp = session.get(url, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        return soup.select_one("input[name='action'][value='editsubmission']") is not None
+    except Exception:
+        log.warning("Could not verify submission status for %s", url, exc_info=True)
+        return False
 
 
 def fetch_all_moodle_events(
@@ -241,28 +259,39 @@ def fetch_all_moodle_events(
 
 
 def filter_new_events(
+    session: requests.Session,
     all_events: list[dict[str, Any]],
     sent_ids: list[str],
 ) -> list[dict[str, Any]]:
-    """Return events that have not been notified yet."""
+    """Return events that have not been notified yet and are open for submission."""
     seen = set(sent_ids)
-    new  = [ev for ev in all_events if ev["id"] not in seen]
-    log.info("Found %d new event(s).", len(new))
+    new: list[dict[str, Any]] = []
+
+    for ev in all_events:
+        if ev["id"] in seen:
+            continue
+        if not is_submission_open(session, ev["link"]):
+            log.info("Skipping locked assignment: %s", ev["title"])
+            continue
+        new.append(ev)
+
+    log.info("Found %d new open event(s).", len(new))
     return new
 
 
 def filter_reminder_events(
     all_events: list[dict[str, Any]],
+    sent_event_ids: list[str],
     sent_reminder_ids: list[str],
-    skip_event_ids: set[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """
-    Return (first_reminders, final_reminders) for events approaching their deadline.
-    Skips events already being sent as brand-new in the same run.
+    Return (first_reminders, final_reminders) for already-notified open events
+    approaching their deadline.
     """
     now_ts           = datetime.now(tz=CAIRO_TZ).timestamp()
     first_cutoff_ts  = now_ts + REMINDER_HOURS * 3600
     final_cutoff_ts  = now_ts + FINAL_REMINDER_HOURS * 3600
+    known_open_ids   = set(sent_event_ids)
     already_reminded = set(sent_reminder_ids)
 
     first_reminders: list[dict[str, Any]] = []
@@ -272,7 +301,8 @@ def filter_reminder_events(
         ts = ev.get("timesort")
         if not ts or not (now_ts < ts <= first_cutoff_ts):
             continue
-        if ev["id"] in skip_event_ids:
+        # Only remind for events that were already opened and notified in a prior run.
+        if ev["id"] not in known_open_ids:
             continue
 
         final_key = f"{ev['id']}_final"
@@ -383,7 +413,7 @@ _DIVIDER = "────────────────────"
 
 
 def build_event_message(event: dict[str, Any]) -> str:
-    """Initial notification -- sent as soon as a new event appears."""
+    """Initial notification -- sent as soon as a new open event appears."""
     task       = event["title"].replace(" is due", "").strip()
     instructor = resolve_instructor(event["course"])
     e          = html.escape
@@ -487,11 +517,10 @@ def main() -> None:
     dash_html, key = authenticate(session)
 
     all_events = fetch_all_moodle_events(session, key)
-    new_events = filter_new_events(all_events, sent_events)
-    new_ids    = {ev["id"] for ev in new_events}
+    new_events = filter_new_events(session, all_events, sent_events)
 
     first_reminders, final_reminders = filter_reminder_events(
-        all_events, sent_reminders, skip_event_ids=new_ids
+        all_events, sent_events, sent_reminders
     )
     new_grades = fetch_grades(session, dash_html, sent_grades)
 
