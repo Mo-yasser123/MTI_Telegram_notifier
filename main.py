@@ -444,9 +444,24 @@ def send_message(text: str) -> bool:
 _DIVIDER = "────────────────────"
 
 
-def _is_quiz_event(event: dict[str, Any]) -> bool:
-    haystack = f"{event.get('title', '')} {event.get('link', '')}".lower()
-    return "quiz" in haystack or "/mod/quiz/" in haystack
+def _classify_event(event: dict[str, Any]) -> str:
+    """
+    Classify an event into:
+    - 'quiz_closes': quiz deadline / closing event
+    - 'quiz_opens' : quiz opening / upcoming quiz event
+    - 'task'       : regular assignment or non-quiz event
+    """
+    title = (event.get("title") or "").lower()
+    link  = (event.get("link") or "").lower()
+    is_quiz = "quiz" in title or "/mod/quiz/" in link
+
+    if not is_quiz:
+        return "task"
+
+    if re.search(r"\bclos(e|es|ed|ing)\b", title):
+        return "quiz_closes"
+
+    return "quiz_opens"
 
 
 def build_event_message(event: dict[str, Any]) -> str:
@@ -484,8 +499,14 @@ def build_reminder_message(event: dict[str, Any]) -> str:
     e          = html.escape
     unit_ar    = "ساعة" if REMINDER_HOURS == 1 else "ساعات"
     unit_en    = "hour" if REMINDER_HOURS == 1 else "hours"
+    kind       = _classify_event(event)
 
-    if _is_quiz_event(event):
+    if kind == "quiz_closes":
+        note = (
+            f"الحق بسرعة يا شباب الكويز قرب يقفل — فاضل {REMINDER_HOURS} {unit_ar} بس.\n"
+            f"Hurry up! The quiz is closing soon — only {REMINDER_HOURS} {unit_en} left."
+        )
+    elif kind == "quiz_opens":
         note = (
             f"الكويز معاده قرب يا شباب فاضل {REMINDER_HOURS} {unit_ar} — الحقوا ذاكروا.\n"
             f"The quiz is coming up soon, {REMINDER_HOURS} {unit_en} left — get ready and study!"
@@ -517,8 +538,14 @@ def build_final_reminder_message(event: dict[str, Any]) -> str:
     instructor = resolve_instructor(event["course"])
     e          = html.escape
     unit_en    = "HOUR" if FINAL_REMINDER_HOURS == 1 else "HOURS"
+    kind       = _classify_event(event)
 
-    if _is_quiz_event(event):
+    if kind == "quiz_closes":
+        note = (
+            "الحق بسرعة يا شباب الكويز هيقفل خلاص — ادخل وسلّم قبل ما الوقت يخلص.\n"
+            "Hurry up! The quiz is about to close — submit now before time runs out."
+        )
+    elif kind == "quiz_opens":
         note = (
             "الكويز معاده قرب جداً يا شباب — استعدوا وادخلوا قبل ما الوقت يعدي.\n"
             "Final call: the quiz starts very soon — get ready before time runs out."
