@@ -2,7 +2,7 @@ name: MTI Telegram Bot
 
 on:
   schedule:
-    - cron: "17 */2 * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -51,27 +51,4 @@ jobs:
             git pull --rebase
             git push
           fi
-
-      - name: Notify on failure
-        if: failure()
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: |
-          python3 -c '
-          import json, os, urllib.request
-          token = os.environ.get("TELEGRAM_TOKEN", "")
-          chat_id = os.environ.get("CHAT_ID", "")
-          if token and chat_id:
-              data = json.dumps({
-                  "chat_id": chat_id,
-                  "text": "<b>BOT ERROR</b>\n────────────────────\nMTI E-Learning Notifier failed on GitHub Actions.",
-                  "parse_mode": "HTML",
-              }).encode("utf-8")
-              req = urllib.request.Request(
-                  f"https://api.telegram.org/bot{token}/sendMessage",
-                  data=data,
-                  headers={"Content-Type": "application/json"},
-              )
-              urllib.request.urlopen(req, timeout=15)
-          '
+          
