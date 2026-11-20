@@ -12,8 +12,8 @@ How events are sourced:
 
 Notifications sent:
 1. Immediately when a new visible upcoming event appears.
-2. First reminder when the deadline is within REMINDER_HOURS hours.
-3. Final reminder when the deadline is within FINAL_REMINDER_HOURS hour(s).
+2. First reminder when the deadline / quiz time is within REMINDER_HOURS hours.
+3. Final reminder when the deadline / quiz time is within FINAL_REMINDER_HOURS hour(s).
 """
 
 from __future__ import annotations
@@ -267,7 +267,6 @@ def fetch_all_moodle_events(
         title    = (ev.get("name") or "Untitled").strip()
         event_id = str(ev.get("id") or "")
 
-        # Must exist in the Dashboard 'Upcoming events' block
         in_dashboard = (
             (event_id and event_id in visible_ids)
             or (title.lower() in visible_titles)
@@ -446,6 +445,11 @@ def send_message(text: str) -> bool:
 _DIVIDER = "────────────────────"
 
 
+def _is_quiz_event(event: dict[str, Any]) -> bool:
+    haystack = f"{event.get('title', '')} {event.get('link', '')}".lower()
+    return "quiz" in haystack or "/mod/quiz/" in haystack
+
+
 def build_event_message(event: dict[str, Any]) -> str:
     """Initial notification -- sent as soon as a new event appears."""
     task       = event["title"].replace(" is due", "").strip()
@@ -475,20 +479,33 @@ def build_event_message(event: dict[str, Any]) -> str:
 
 
 def build_reminder_message(event: dict[str, Any]) -> str:
-    """First reminder -- 6 hours before the deadline."""
+    """First reminder -- REMINDER_HOURS before the deadline or quiz time."""
     task       = event["title"].replace(" is due", "").strip()
     instructor = resolve_instructor(event["course"])
     e          = html.escape
+    unit_ar    = "ساعة" if REMINDER_HOURS == 1 else "ساعات"
+    unit_en    = "hour" if REMINDER_HOURS == 1 else "hours"
+
+    if _is_quiz_event(event):
+        note = (
+            f"الكويز معاده قرب يا شباب فاضل {REMINDER_HOURS} {unit_ar} — الحقوا ذاكروا.\n"
+            f"The quiz is coming up soon, {REMINDER_HOURS} {unit_en} left — get ready and study!"
+        )
+    else:
+        note = (
+            f"المهمة دي هتنتهي خلال {REMINDER_HOURS} {unit_ar} — اتأكد إنك سلمت.\n"
+            f"This task is due in {REMINDER_HOURS} {unit_en} — make sure you submit on time."
+        )
 
     parts = [
-        f"<b>DEADLINE REMINDER  --  {REMINDER_HOURS} HOURS LEFT</b>",
+        f"<b>DEADLINE REMINDER  --  {REMINDER_HOURS} {unit_en.upper()} LEFT</b>",
         _DIVIDER,
         f"<b>Course</b>      {e(event['course'])}",
         f"<b>Instructor</b>  {e(instructor)}",
         f"<b>Task</b>        {e(task)}",
         f"<b>Deadline</b>    {e(event['deadline'])}",
         "",
-        f"المهمة دي هتنتهي خلال {REMINDER_HOURS} ساعات — اتأكد إنك سلمت.",
+        e(note),
         _DIVIDER,
         f"<a href='{e(event['link'], quote=True)}'><b>Open in Moodle</b></a>",
     ]
@@ -496,21 +513,32 @@ def build_reminder_message(event: dict[str, Any]) -> str:
 
 
 def build_final_reminder_message(event: dict[str, Any]) -> str:
-    """Final reminder -- 1 hour before the deadline closes."""
+    """Final reminder -- right before the deadline or quiz time."""
     task       = event["title"].replace(" is due", "").strip()
     instructor = resolve_instructor(event["course"])
     e          = html.escape
-    unit       = "HOUR" if FINAL_REMINDER_HOURS == 1 else "HOURS"
+    unit_en    = "HOUR" if FINAL_REMINDER_HOURS == 1 else "HOURS"
+
+    if _is_quiz_event(event):
+        note = (
+            "الكويز معاده قرب جداً يا شباب — استعدوا وادخلوا قبل ما الوقت يعدي.\n"
+            "Final call: the quiz starts very soon — get ready before time runs out."
+        )
+    else:
+        note = (
+            "تنبيه أخير: الموعد قرب يقفل — سلّم دلوقتي قبل ما الوقت يخلص.\n"
+            "Final reminder: the deadline is closing soon — submit now before time runs out."
+        )
 
     parts = [
-        f"<b>FINAL REMINDER  --  LESS THAN {FINAL_REMINDER_HOURS} {unit} LEFT</b>",
+        f"<b>FINAL REMINDER  --  LESS THAN {FINAL_REMINDER_HOURS} {unit_en} LEFT</b>",
         _DIVIDER,
         f"<b>Course</b>      {e(event['course'])}",
         f"<b>Instructor</b>  {e(instructor)}",
         f"<b>Task</b>        {e(task)}",
         f"<b>Deadline</b>    {e(event['deadline'])}",
         "",
-        "تنبيه أخير: الموعد قرب يقفل — سلّم دلوقتي قبل ما الوقت يخلص.",
+        e(note),
         _DIVIDER,
         f"<a href='{e(event['link'], quote=True)}'><b>Open in Moodle</b></a>",
     ]
@@ -560,41 +588,4 @@ def main() -> None:
     )
     new_grades = fetch_grades(session, dash_html, sent_grades)
 
-    if not new_events and not first_reminders and not final_reminders and not new_grades:
-        log.info("Nothing new -- exiting.")
-        return
-
-    for ev in new_events:
-        if send_message(build_event_message(ev)):
-            sent_events.append(ev["id"])
-            save_ids(EVENTS_FILE, sent_events)
-
-    for ev in first_reminders:
-        if send_message(build_reminder_message(ev)):
-            sent_reminders.append(ev["reminder_key"])
-            save_ids(REMINDERS_FILE, sent_reminders)
-
-    for ev in final_reminders:
-        if send_message(build_final_reminder_message(ev)):
-            sent_reminders.append(ev["reminder_key"])
-            save_ids(REMINDERS_FILE, sent_reminders)
-
-    for gr in new_grades:
-        if send_message(build_grade_message(gr)):
-            sent_grades.append(gr["id"])
-            save_ids(GRADES_FILE, sent_grades)
-
-    log.info(
-        "Done -- %d new event(s), %d first reminder(s), %d final reminder(s), %d grade(s) sent.",
-        len(new_events), len(first_reminders), len(final_reminders), len(new_grades),
-    )
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception as exc:
-        log.critical("Unhandled exception: %s", exc, exc_info=True)
-        sys.exit(1)
+    if not n
