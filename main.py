@@ -369,7 +369,6 @@ def fetch_grades(
     sent_ids: list[str],
 ) -> list[dict[str, str]]:
     """Return courses with newly published midterm grades."""
-
     soup    = BeautifulSoup(dashboard_html, "html.parser")
     courses = {}
 
@@ -588,4 +587,41 @@ def main() -> None:
     )
     new_grades = fetch_grades(session, dash_html, sent_grades)
 
-    if not n
+    if not new_events and not first_reminders and not final_reminders and not new_grades:
+        log.info("Nothing new -- exiting.")
+        return
+
+    for ev in new_events:
+        if send_message(build_event_message(ev)):
+            sent_events.append(ev["id"])
+            save_ids(EVENTS_FILE, sent_events)
+
+    for ev in first_reminders:
+        if send_message(build_reminder_message(ev)):
+            sent_reminders.append(ev["reminder_key"])
+            save_ids(REMINDERS_FILE, sent_reminders)
+
+    for ev in final_reminders:
+        if send_message(build_final_reminder_message(ev)):
+            sent_reminders.append(ev["reminder_key"])
+            save_ids(REMINDERS_FILE, sent_reminders)
+
+    for gr in new_grades:
+        if send_message(build_grade_message(gr)):
+            sent_grades.append(gr["id"])
+            save_ids(GRADES_FILE, sent_grades)
+
+    log.info(
+        "Done -- %d new event(s), %d first reminder(s), %d final reminder(s), %d grade(s) sent.",
+        len(new_events), len(first_reminders), len(final_reminders), len(new_grades),
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        log.critical("Unhandled exception: %s", exc, exc_info=True)
+        sys.exit(1)
