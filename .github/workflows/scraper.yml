@@ -65,4 +65,4 @@ jobs:
           else
             git commit -m "chore: update sent notifications state"
             git push
-          fi
+          fi 
