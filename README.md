@@ -13,6 +13,7 @@ Automated Python bot that monitors the MTI University Moodle portal and delivers
 | Two-Stage Smart Reminders | Sends a 6-hour reminder and a final alert within 1 hour, distinguishing between **quiz openings**, **quiz closings**, and **regular tasks** |
 | Exact Time Remaining | Calculates and displays the actual remaining time in hours and minutes at the moment of delivery to avoid confusion |
 | Midterm Grade Alerts | Monitors enrolled course grade reports and notifies as soon as midterm grades are published |
+| Manual Test Channel Dispatch | Supports manual workflow triggering with a dedicated `test_channel` input to safely verify message formatting and delivery before broadcasting to the main channel |
 | Clean Functional Formatting | Uses minimal, purposeful emojis and structured HTML templates suitable for university communities |
 | Persistent State Memory | Maintains JSON state files for event timestamps, reminder keys, and grade IDs to prevent duplicates |
 | Automated Execution | Runs serverless on GitHub Actions every 30 minutes with concurrency control and automated state commits |
@@ -23,6 +24,8 @@ Automated Python bot that monitors the MTI University Moodle portal and delivers
 
 ```text
 GitHub Actions (Every 30m / Manual) ──▶ Moodle (Auth + Dashboard & AJAX API) ──▶ Telegram Bot API
+       │                                                                               │
+ [test_channel input]                                                       (Main or Test Channel)
                                                │
                                          State Sync
                                      (sent_events.json
@@ -30,11 +33,11 @@ GitHub Actions (Every 30m / Manual) ──▶ Moodle (Auth + Dashboard & AJAX AP
                                       sent_grades.json)
 ```
 
-1. **Trigger:** GitHub Actions executes `.github/workflows/scraper.yml` on a 30-minute schedule (`*/30 * * * *`) or via manual dispatch.
+1. **Trigger & Routing:** GitHub Actions executes `.github/workflows/scraper.yml` on a 30-minute schedule (`*/30 * * * *`) or via manual dispatch (`workflow_dispatch`) with an optional `test_channel` input to route alerts to a sandbox Telegram channel.
 2. **Authentication & Verification:** `main.py` authenticates using encrypted repository secrets, extracts session tokens (`logintoken` and `sesskey`), and validates Calendar API events against the dashboard's `Upcoming events` block.
 3. **Change & Reminder Engine:** Compares live events against stored timestamps in `sent_events.json` to separate brand-new items from rescheduled ones, then evaluates 6-hour and 1-hour reminder windows in `Africa/Cairo` time.
 4. **Grade Monitoring:** Checks course grade tables for newly published midterm scores not yet logged in `sent_grades.json`.
-5. **Delivery & Persistence:** Sends formatted HTML messages to Telegram and commits updated JSON state files back to the repository.
+5. **Delivery & Persistence:** Sends formatted HTML messages to the target Telegram channel and commits updated JSON state files back to the repository.
 
 ---
 
@@ -44,7 +47,7 @@ GitHub Actions (Every 30m / Manual) ──▶ Moodle (Auth + Dashboard & AJAX AP
 MTI_Telegram_notifier/
 ├── .github/
 │   └── workflows/
-│       └── scraper.yml       # Scheduled & manual GitHub Actions workflow
+│       └── scraper.yml       # Scheduled & manual GitHub Actions workflow (with test_channel support)
 ├── .gitignore
 ├── README.md
 ├── main.py                   # Core authentication, scraping, filtering, and Telegram delivery
@@ -135,7 +138,7 @@ Open in Moodle
 - **`requests` & `BeautifulSoup4`** — Session management, HTML parsing, and Moodle AJAX API integration
 - **`python-dotenv` & `zoneinfo`** — Environment configuration and `Africa/Cairo` timezone handling
 - **Telegram Bot API** — Structured HTML message delivery
-- **GitHub Actions** — Scheduled execution and automated state persistence
+- **GitHub Actions** — Scheduled execution, manual test dispatch, and automated state persistence
 
 ---
 
