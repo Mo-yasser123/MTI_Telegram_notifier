@@ -142,6 +142,9 @@ Open in Moodle
 
 ---
 
+### Bot currently status : 🟢
+---
+
 ## Copyright & License
 
 All rights reserved © **Mohamed Yasser**.
