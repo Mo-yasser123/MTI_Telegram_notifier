@@ -1,21 +1,20 @@
-name: MTI Telegram Bot
+name: MTI Moodle Telegram Notifier
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "13,23,33,43,53 * * * *"
   workflow_dispatch:
+
+concurrency:
+  group: mti-moodle-notifier
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
-concurrency:
-  group: mti-telegram-bot
-  cancel-in-progress: false
-
 jobs:
-  run-bot:
+  notify:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
@@ -25,13 +24,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      - name: Run MTI Notifier
+      - name: Run MTI notifier
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
@@ -39,16 +37,14 @@ jobs:
           UNI_PASS: ${{ secrets.UNI_PASS }}
         run: python main.py
 
-      - name: Commit updated state files
+      - name: Commit updated notification state
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          for f in sent_events.json sent_grades.json sent_reminders.json; do
-            [ -f "$f" ] && git add "$f"
-          done
-          if ! git diff --staged --quiet; then
+          git add sent_events.json sent_grades.json sent_reminders.json
+          if git diff --staged --quiet; then
+            echo "No state changes to commit."
+          else
             git commit -m "chore: update sent notifications state"
-            git pull --rebase
             git push
           fi
-          
