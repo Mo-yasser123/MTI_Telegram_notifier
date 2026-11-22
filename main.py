@@ -347,16 +347,48 @@ def filter_reminder_events(
 # Grade scraping
 # ---------------------------------------------------------------------------
 
-_MIDTERM_KEYWORDS = ["mid", "mt", "ميد"]
-_FINAL_KEYWORDS   = ["final exam", "final", "فاينل"]
+_MIDTERM_KEYWORDS = [
+    "midterm",
+    "mid term",
+    "mid-term",
+    "midterms",
+    "mid term exam",
+    "midterm exam",
+    "mt",
+    "m.t",
+    "m.t.",
+    "mid",
+    "ميد",
+    "ميدتيرم",
+    "ميد تيرم",
+    "منتصف الفصل",
+]
+
+_FINAL_KEYWORDS = [
+    "final exam",
+    "finals",
+    "final",
+    "end of term",
+    "end-of-term",
+    "فاينل",
+    "النهائي",
+    "الامتحان النهائي",
+]
 
 
 def _detect_exam_type(row_text: str) -> str | None:
-    text = row_text.lower()
+    cleaned = re.sub(r"""["'/\\-]+""", " ", row_text.lower())
+    text = re.sub(r"\s+", " ", cleaned).strip()
+    tokens = set(text.split())
+
     if any(kw in text for kw in _FINAL_KEYWORDS):
         return "final"
-    if any(kw in text for kw in _MIDTERM_KEYWORDS):
+
+    if any(" " in kw and kw in text for kw in _MIDTERM_KEYWORDS):
         return "midterm"
+    if any(" " not in kw and kw in tokens for kw in _MIDTERM_KEYWORDS):
+        return "midterm"
+
     return None
 
 
@@ -391,20 +423,32 @@ def fetch_grades(
             gsoup = BeautifulSoup(r.text, "html.parser")
 
             for row in gsoup.find_all("tr"):
-                exam_type = _detect_exam_type(row.get_text(" ", strip=True))
+                row_text = row.get_text(" ", strip=True)
+                exam_type = _detect_exam_type(row_text)
                 if not exam_type:
                     continue
 
                 gid = f"{cid}_{exam_type}"
-                if gid in sent_set:
-                    continue
-
                 cell = row.select_one("[class*='column-grade']")
+                if not cell:
+                    tds = row.find_all("td")
+                    cell = tds[-1] if len(tds) >= 2 else None
                 if not cell:
                     continue
 
-                val = cell.get_text(strip=True)
-                if val and val not in ("-", "—", ""):
+                val = cell.get_text(" ", strip=True)
+                log.info(
+                    "Matched [%s] (%s) -> val='%s' | already_sent=%s",
+                    cname,
+                    exam_type,
+                    val,
+                    gid in sent_set,
+                )
+
+                if gid in sent_set:
+                    continue
+
+                if val and val not in ("-", "—", "–", ""):
                     results.append({
                         "id": gid,
                         "course": cname,
