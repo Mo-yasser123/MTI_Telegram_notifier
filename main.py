@@ -1,7 +1,7 @@
 """
 MTI E-Learning Notifier
 ~~~~~~~~~~~~~~~~~~~~~~~
-Monitors the MTI Moodle platform for upcoming events and midterm grades,
+Monitors the MTI Moodle platform for upcoming events, midterm grades, and final grades,
 then delivers formatted notifications to a Telegram chat.
 
 How events are sourced:
@@ -14,6 +14,7 @@ Notifications sent:
 1. Immediately when a new visible upcoming event appears.
 2. First reminder when the deadline / quiz time is within REMINDER_HOURS hours.
 3. Final reminder when the deadline / quiz time is within FINAL_REMINDER_HOURS hour(s).
+4. Immediately when midterm or final grades are published.
 """
 
 from __future__ import annotations
@@ -361,6 +362,16 @@ def filter_reminder_events(
 # ---------------------------------------------------------------------------
 
 _MIDTERM_KEYWORDS = ["mid", "mt", "ميد"]
+_FINAL_KEYWORDS   = ["final exam", "final", "فاينل"]
+
+
+def _detect_exam_type(row_text: str) -> str | None:
+    text = row_text.lower()
+    if any(kw in text for kw in _FINAL_KEYWORDS):
+        return "final"
+    if any(kw in text for kw in _MIDTERM_KEYWORDS):
+        return "midterm"
+    return None
 
 
 def fetch_grades(
@@ -368,7 +379,7 @@ def fetch_grades(
     dashboard_html: str,
     sent_ids: list[str],
 ) -> list[dict[str, str]]:
-    """Return courses with newly published midterm grades."""
+    """Return courses with newly published midterm or final grades immediately."""
     soup    = BeautifulSoup(dashboard_html, "html.parser")
     courses = {}
 
@@ -382,8 +393,9 @@ def fetch_grades(
     results  = []
 
     for cid, cname in courses.items():
-        gid = f"{cid}_midterm"
-        if gid in sent_set:
+        mid_gid   = f"{cid}_midterm"
+        final_gid = f"{cid}_final"
+        if mid_gid in sent_set and final_gid in sent_set:
             continue
 
         grade_url = f"{MOODLE_BASE_URL}/grade/report/user/index.php?id={cid}"
@@ -393,16 +405,27 @@ def fetch_grades(
             gsoup = BeautifulSoup(r.text, "html.parser")
 
             for row in gsoup.find_all("tr"):
-                text = row.get_text(" ", strip=True).lower()
-                if not any(kw in text for kw in _MIDTERM_KEYWORDS):
+                exam_type = _detect_exam_type(row.get_text(" ", strip=True))
+                if not exam_type:
                     continue
+
+                gid = f"{cid}_{exam_type}"
+                if gid in sent_set:
+                    continue
+
                 cell = row.select_one("[class*='column-grade']")
                 if not cell:
                     continue
+
                 val = cell.get_text(strip=True)
                 if val and val not in ("-", "—", ""):
-                    results.append({"id": gid, "course": cname, "link": grade_url})
-                    break
+                    results.append({
+                        "id": gid,
+                        "course": cname,
+                        "link": grade_url,
+                        "exam_type": exam_type,
+                    })
+                    sent_set.add(gid)
         except Exception:
             log.warning("Could not retrieve grades for '%s'.", cname, exc_info=True)
 
@@ -471,7 +494,7 @@ def build_event_message(event: dict[str, Any]) -> str:
     e          = html.escape
 
     parts = [
-        "<b>ACADEMIC NOTIFICATION</b>",
+        "📌 <b>ACADEMIC NOTIFICATION</b>",
         _DIVIDER,
         f"<b>Course</b>      {e(event['course'])}",
         f"<b>Instructor</b>  {e(instructor)}",
@@ -503,22 +526,22 @@ def build_reminder_message(event: dict[str, Any]) -> str:
 
     if kind == "quiz_closes":
         note = (
-            f"الحق بسرعة يا شباب الكويز قرب يقفل — فاضل {REMINDER_HOURS} {unit_ar} بس.\n"
+            f"الحقوا بسرعة يا شباب، الكويز قرب يقفل — فاضل {REMINDER_HOURS} {unit_ar} بس.\n"
             f"Hurry up! The quiz is closing soon — only {REMINDER_HOURS} {unit_en} left."
         )
     elif kind == "quiz_opens":
         note = (
-            f"الكويز معاده قرب يا شباب فاضل {REMINDER_HOURS} {unit_ar} — الحقوا ذاكروا.\n"
+            f"الكويز ميعاده قرب يا شباب، فاضل {REMINDER_HOURS} {unit_ar} — الحقوا ذاكروا.\n"
             f"The quiz is coming up soon, {REMINDER_HOURS} {unit_en} left — get ready and study!"
         )
     else:
         note = (
-            f"المهمة دي هتنتهي خلال {REMINDER_HOURS} {unit_ar} — اتأكد إنك سلمت.\n"
+            f"المهمة دي هتنتهي خلال {REMINDER_HOURS} {unit_ar} — اتأكد إنك سلّمت.\n"
             f"This task is due in {REMINDER_HOURS} {unit_en} — make sure you submit on time."
         )
 
     parts = [
-        f"<b>DEADLINE REMINDER  --  {REMINDER_HOURS} {unit_en.upper()} LEFT</b>",
+        f"⏳ <b>DEADLINE REMINDER  --  {REMINDER_HOURS} {unit_en.upper()} LEFT</b>",
         _DIVIDER,
         f"<b>Course</b>      {e(event['course'])}",
         f"<b>Instructor</b>  {e(instructor)}",
@@ -542,12 +565,12 @@ def build_final_reminder_message(event: dict[str, Any]) -> str:
 
     if kind == "quiz_closes":
         note = (
-            "الحق بسرعة يا شباب الكويز هيقفل خلاص — ادخل وسلّم قبل ما الوقت يخلص.\n"
+            "الحقوا بسرعة يا شباب، الكويز هيقفل خلاص — ادخلوا وسلّموا قبل ما الوقت يخلص.\n"
             "Hurry up! The quiz is about to close — submit now before time runs out."
         )
     elif kind == "quiz_opens":
         note = (
-            "الكويز معاده قرب جداً يا شباب — استعدوا وادخلوا قبل ما الوقت يعدي.\n"
+            "الكويز ميعاده قرب جداً يا شباب — استعدوا وادخلوا قبل ما الوقت يعدي.\n"
             "Final call: the quiz starts very soon — get ready before time runs out."
         )
     else:
@@ -557,7 +580,7 @@ def build_final_reminder_message(event: dict[str, Any]) -> str:
         )
 
     parts = [
-        f"<b>FINAL REMINDER  --  LESS THAN {FINAL_REMINDER_HOURS} {unit_en} LEFT</b>",
+        f"🚨 <b>FINAL REMINDER  --  LESS THAN {FINAL_REMINDER_HOURS} {unit_en} LEFT</b>",
         _DIVIDER,
         f"<b>Course</b>      {e(event['course'])}",
         f"<b>Instructor</b>  {e(instructor)}",
@@ -572,13 +595,19 @@ def build_final_reminder_message(event: dict[str, Any]) -> str:
 
 
 def build_grade_message(grade: dict[str, str]) -> str:
-    e = html.escape
+    """Notification -- sent when midterm or final grades are published."""
+    e         = html.escape
+    exam_type = grade.get("exam_type", "midterm")
+    label_ar  = "الفاينل" if exam_type == "final" else "الميد تيرم"
+    label_en  = "Final" if exam_type == "final" else "Midterm"
+
     parts = [
-        "<b>GRADE PUBLISHED</b>",
+        "🎓 <b>GRADE PUBLISHED</b>",
         _DIVIDER,
-        f"درجة الميد تيرم بتاعت <b>{e(grade['course'])}</b> نزلت.",
-        "",
-        f"<a href='{e(grade['link'], quote=True)}'><b>اعرف نتيجتك</b></a>",
+        f"درجة <b>{label_ar}</b> بتاعة <b>{e(grade['course'])}</b> نزلت.",
+        f"{label_en} grades for <b>{e(grade['course'])}</b> have been published.",
+        _DIVIDER,
+        f"<a href='{e(grade['link'], quote=True)}'><b>اعرف نتيجتك / Check your grade</b></a>",
     ]
     return "\n".join(parts)
 
@@ -589,66 +618,57 @@ def build_grade_message(grade: dict[str, str]) -> str:
 
 
 def main() -> None:
-    log.info("MTI Notifier -- starting.")
-
-    missing = [k for k, v in [
-        ("TELEGRAM_TOKEN", TELEGRAM_TOKEN), ("CHAT_ID", CHAT_ID),
-        ("UNI_USER", UNI_USER),             ("UNI_PASS", UNI_PASS),
-    ] if not v]
+    missing = [
+        name for name, val in (
+            ("TELEGRAM_TOKEN", TELEGRAM_TOKEN),
+            ("CHAT_ID", CHAT_ID),
+            ("UNI_USER", UNI_USER),
+            ("UNI_PASS", UNI_PASS),
+        )
+        if not val
+    ]
     if missing:
-        raise SystemExit(f"Missing environment variables: {', '.join(missing)}")
+        log.error("Missing required environment variable(s): %s", ", ".join(missing))
+        sys.exit(1)
 
     sent_events    = load_ids(EVENTS_FILE)
     sent_grades    = load_ids(GRADES_FILE)
     sent_reminders = load_ids(REMINDERS_FILE)
 
-    session        = build_session()
-    dash_html, key = authenticate(session)
+    session = build_session()
+    dashboard_html, sesskey = authenticate(session)
 
-    all_events = fetch_all_moodle_events(session, key, dash_html)
+    all_events = fetch_all_moodle_events(session, sesskey, dashboard_html)
     new_events = filter_new_events(all_events, sent_events)
-    new_ids    = {ev["id"] for ev in new_events}
 
-    first_reminders, final_reminders = filter_reminder_events(
-        all_events, sent_reminders, skip_event_ids=new_ids
-    )
-    new_grades = fetch_grades(session, dash_html, sent_grades)
-
-    if not new_events and not first_reminders and not final_reminders and not new_grades:
-        log.info("Nothing new -- exiting.")
-        return
-
+    sent_new_ids: set[str] = set()
     for ev in new_events:
         if send_message(build_event_message(ev)):
             sent_events.append(ev["id"])
-            save_ids(EVENTS_FILE, sent_events)
+            sent_new_ids.add(ev["id"])
+
+    first_reminders, final_reminders = filter_reminder_events(
+        all_events, sent_reminders, sent_new_ids
+    )
 
     for ev in first_reminders:
         if send_message(build_reminder_message(ev)):
             sent_reminders.append(ev["reminder_key"])
-            save_ids(REMINDERS_FILE, sent_reminders)
 
     for ev in final_reminders:
         if send_message(build_final_reminder_message(ev)):
             sent_reminders.append(ev["reminder_key"])
-            save_ids(REMINDERS_FILE, sent_reminders)
 
-    for gr in new_grades:
-        if send_message(build_grade_message(gr)):
-            sent_grades.append(gr["id"])
-            save_ids(GRADES_FILE, sent_grades)
+    new_grades = fetch_grades(session, dashboard_html, sent_grades)
+    for grade in new_grades:
+        if send_message(build_grade_message(grade)):
+            sent_grades.append(grade["id"])
 
-    log.info(
-        "Done -- %d new event(s), %d first reminder(s), %d final reminder(s), %d grade(s) sent.",
-        len(new_events), len(first_reminders), len(final_reminders), len(new_grades),
-    )
+    save_ids(EVENTS_FILE, sent_events)
+    save_ids(GRADES_FILE, sent_grades)
+    save_ids(REMINDERS_FILE, sent_reminders)
+    log.info("Run completed successfully.")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception as exc:
-        log.critical("Unhandled exception: %s", exc, exc_info=True)
-        sys.exit(1)
+    main()
