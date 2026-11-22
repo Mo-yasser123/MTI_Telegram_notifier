@@ -781,7 +781,7 @@ def main() -> None:
         save_ids(EVENTS_FILE, sent_events)
         save_ids(GRADES_FILE, sent_grades)
         save_ids(REMINDERS_FILE, sent_reminders)
-        log.info("Run completed successfully.")
+        log.info("Run completed successfully.") 
 
 
 if __name__ == "__main__":
