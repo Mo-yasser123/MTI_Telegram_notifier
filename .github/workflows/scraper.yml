@@ -4,6 +4,19 @@ on:
   schedule:
     - cron: "13,23,33,43,53 * * * *"
   workflow_dispatch:
+    inputs:
+      test_channel:
+        description: "Send to TEST_CHAT_ID without updating state files"
+        type: boolean
+        default: true
+      preview_samples:
+        description: "Send sample previews to test channel (forces test_channel)"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Print messages to logs without sending to Telegram or saving state"
+        type: boolean
+        default: false
 
 concurrency:
   group: mti-moodle-notifier
@@ -33,11 +46,16 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          TEST_CHAT_ID: ${{ secrets.TEST_CHAT_ID }}
           UNI_USER: ${{ secrets.UNI_USER }}
           UNI_PASS: ${{ secrets.UNI_PASS }}
+          TEST_CHANNEL: ${{ inputs.test_channel }}
+          PREVIEW_SAMPLES: ${{ inputs.preview_samples }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: python main.py
 
       - name: Commit updated notification state
+        if: ${{ !inputs.test_channel && !inputs.preview_samples && !inputs.dry_run }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
