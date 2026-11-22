@@ -4,28 +4,23 @@ MTI E-Learning Notifier
 Monitors the MTI Moodle platform for upcoming events, midterm grades, and final grades,
 then delivers formatted notifications to a Telegram chat.
 
-How events are sourced:
-- Fetches rich event details (description, exact timestamp, direct link)
-  from the Moodle Calendar AJAX API.
-- Cross-checks against the Dashboard 'Upcoming events' block so ONLY
-  events actively visible on the user's dashboard are dispatched.
-
-Notifications sent:
-1. Immediately when a new visible upcoming event appears.
-2. First reminder when the deadline / quiz time is within REMINDER_HOURS hours.
-3. Final reminder when the deadline / quiz time is within FINAL_REMINDER_HOURS hour(s).
-4. Immediately when midterm or final grades are published.
+Supports:
+- --test-channel / TEST_CHANNEL=true       : Sends to TEST_CHAT_ID without updating state files.
+- --preview-samples / PREVIEW_SAMPLES=true : Sends sample previews to TEST_CHAT_ID without
+  requiring new Moodle items or updating state files.
+- --dry-run / DRY_RUN=true                 : Logs messages without sending to Telegram or saving state.
 """
 
 from __future__ import annotations
 
+import argparse
 import html
 import json
 import logging
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -43,10 +38,19 @@ from urllib3.util.retry import Retry
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
-CHAT_ID: str        = os.getenv("CHAT_ID", "")
-UNI_USER: str       = os.getenv("UNI_USER", "")
-UNI_PASS: str       = os.getenv("UNI_PASS", "")
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+TELEGRAM_TOKEN: str       = os.getenv("TELEGRAM_TOKEN", "")
+CHAT_ID: str              = os.getenv("CHAT_ID", "")
+TEST_CHAT_ID: str         = os.getenv("TEST_CHAT_ID", "")
+UNI_USER: str             = os.getenv("UNI_USER", "")
+UNI_PASS: str             = os.getenv("UNI_PASS", "")
+ENV_DRY_RUN: bool         = _env_flag("DRY_RUN")
+ENV_TEST_CHANNEL: bool    = _env_flag("TEST_CHANNEL")
+ENV_PREVIEW_SAMPLES: bool = _env_flag("PREVIEW_SAMPLES")
 
 MOODLE_BASE_URL      = "https://elearning-01.mti.edu.eg"
 EVENTS_FILE          = BASE_DIR / "sent_events.json"
@@ -141,10 +145,6 @@ def build_session() -> requests.Session:
 
 
 def authenticate(session: requests.Session) -> tuple[str, str]:
-    """
-    Log in to Moodle and return (dashboard_html, sesskey).
-    Raises RuntimeError on failure.
-    """
     login_url = f"{MOODLE_BASE_URL}/login/index.php"
 
     page = session.get(login_url, timeout=REQUEST_TIMEOUT)
@@ -187,11 +187,6 @@ def authenticate(session: requests.Session) -> tuple[str, str]:
 def extract_dashboard_event_filter(
     dashboard_html: str,
 ) -> tuple[set[str], set[str]]:
-    """
-    Inspect the Dashboard 'Upcoming events' block (section.block_calendar_upcoming)
-    and return (visible_event_ids, visible_titles_lower) so Calendar API results
-    can be strictly verified against what is shown on the dashboard.
-    """
     soup = BeautifulSoup(dashboard_html, "html.parser")
     block = soup.select_one("section.block_calendar_upcoming")
     if not block:
@@ -232,10 +227,6 @@ def fetch_all_moodle_events(
     sesskey: str,
     dashboard_html: str,
 ) -> list[dict[str, Any]]:
-    """
-    Fetch rich event metadata from the Moodle Calendar AJAX API, keeping ONLY
-    events that are confirmed present in the Dashboard 'Upcoming events' block.
-    """
     visible_ids, visible_titles = extract_dashboard_event_filter(dashboard_html)
     if not visible_ids and not visible_titles:
         return []
@@ -308,7 +299,6 @@ def filter_new_events(
     all_events: list[dict[str, Any]],
     sent_ids: list[str],
 ) -> list[dict[str, Any]]:
-    """Return verified dashboard events that have not been notified yet."""
     seen = set(sent_ids)
     new  = [ev for ev in all_events if ev["id"] not in seen]
     log.info("Found %d new event(s).", len(new))
@@ -320,10 +310,6 @@ def filter_reminder_events(
     sent_reminder_ids: list[str],
     skip_event_ids: set[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """
-    Return (first_reminders, final_reminders) for events approaching their deadline.
-    Skips events already being sent as brand-new in the same run.
-    """
     now_ts           = datetime.now(tz=CAIRO_TZ).timestamp()
     first_cutoff_ts  = now_ts + REMINDER_HOURS * 3600
     final_cutoff_ts  = now_ts + FINAL_REMINDER_HOURS * 3600
@@ -438,13 +424,17 @@ def fetch_grades(
 # ---------------------------------------------------------------------------
 
 
-def send_message(text: str) -> bool:
+def send_message(text: str, target_chat_id: str, dry_run: bool = False) -> bool:
+    if dry_run:
+        log.info("[DRY RUN -> %s] Preview:\n%s", target_chat_id, text)
+        return True
+
     endpoint = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         r = requests.post(
             endpoint,
             json={
-                "chat_id": CHAT_ID,
+                "chat_id": target_chat_id,
                 "text": text,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
@@ -452,7 +442,7 @@ def send_message(text: str) -> bool:
             timeout=20,
         )
         if r.status_code == 200 and r.json().get("ok"):
-            log.info("Message delivered to Telegram.")
+            log.info("Message delivered to Telegram (%s).", target_chat_id)
             return True
         log.error("Telegram rejected the message: %s", r.text)
     except Exception:
@@ -468,12 +458,6 @@ _DIVIDER = "────────────────────"
 
 
 def _classify_event(event: dict[str, Any]) -> str:
-    """
-    Classify an event into:
-    - 'quiz_closes': quiz deadline / closing event
-    - 'quiz_opens' : quiz opening / upcoming quiz event
-    - 'task'       : regular assignment or non-quiz event
-    """
     title = (event.get("title") or "").lower()
     link  = (event.get("link") or "").lower()
     is_quiz = "quiz" in title or "/mod/quiz/" in link
@@ -488,7 +472,6 @@ def _classify_event(event: dict[str, Any]) -> str:
 
 
 def build_event_message(event: dict[str, Any]) -> str:
-    """Initial notification -- sent as soon as a new event appears."""
     task       = event["title"].replace(" is due", "").strip()
     instructor = resolve_instructor(event["course"])
     e          = html.escape
@@ -516,7 +499,6 @@ def build_event_message(event: dict[str, Any]) -> str:
 
 
 def build_reminder_message(event: dict[str, Any]) -> str:
-    """First reminder -- REMINDER_HOURS before the deadline or quiz time."""
     task       = event["title"].replace(" is due", "").strip()
     instructor = resolve_instructor(event["course"])
     e          = html.escape
@@ -556,7 +538,6 @@ def build_reminder_message(event: dict[str, Any]) -> str:
 
 
 def build_final_reminder_message(event: dict[str, Any]) -> str:
-    """Final reminder -- right before the deadline or quiz time."""
     task       = event["title"].replace(" is due", "").strip()
     instructor = resolve_instructor(event["course"])
     e          = html.escape
@@ -595,7 +576,6 @@ def build_final_reminder_message(event: dict[str, Any]) -> str:
 
 
 def build_grade_message(grade: dict[str, str]) -> str:
-    """Notification -- sent when midterm or final grades are published."""
     e         = html.escape
     exam_type = grade.get("exam_type", "midterm")
     label_ar  = "الفاينل" if exam_type == "final" else "الميد تيرم"
@@ -612,24 +592,111 @@ def build_grade_message(grade: dict[str, str]) -> str:
     return "\n".join(parts)
 
 
+def send_sample_previews(target_chat_id: str, dry_run: bool) -> None:
+    now = datetime.now(tz=CAIRO_TZ)
+    fmt = "%A, %d %b %Y  %I:%M %p"
+
+    samples = [
+        build_event_message({
+            "title": "Lab 5 Submission is due",
+            "course": "Introduction to Programming",
+            "deadline": (now + timedelta(days=2)).strftime(fmt),
+            "link": f"{MOODLE_BASE_URL}/my/",
+            "description": "Upload your code and flowchart before the deadline.",
+        }),
+        build_reminder_message({
+            "title": "Quiz 1 closes",
+            "course": "F26 English Language I",
+            "deadline": (now + timedelta(hours=REMINDER_HOURS)).strftime(fmt),
+            "link": f"{MOODLE_BASE_URL}/my/",
+        }),
+        build_final_reminder_message({
+            "title": "Assignment 2 is due",
+            "course": "Linear Algebra",
+            "deadline": (now + timedelta(minutes=40)).strftime(fmt),
+            "link": f"{MOODLE_BASE_URL}/my/",
+        }),
+        build_grade_message({
+            "course": "Introduction to Programming",
+            "exam_type": "midterm",
+            "link": f"{MOODLE_BASE_URL}/my/",
+        }),
+        build_grade_message({
+            "course": "Introduction to Programming",
+            "exam_type": "final",
+            "link": f"{MOODLE_BASE_URL}/my/",
+        }),
+    ]
+
+    for msg in samples:
+        send_message(msg, target_chat_id=target_chat_id, dry_run=dry_run)
+
+
 # ---------------------------------------------------------------------------
-# Entry point
+# CLI & Entry point
 # ---------------------------------------------------------------------------
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="MTI E-Learning Telegram Notifier")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=ENV_DRY_RUN,
+        help="Simulate notifications without sending to Telegram or saving state files.",
+    )
+    parser.add_argument(
+        "--test-channel",
+        action="store_true",
+        default=ENV_TEST_CHANNEL,
+        help="Send notifications to TEST_CHAT_ID without saving state files.",
+    )
+    parser.add_argument(
+        "--preview-samples",
+        action="store_true",
+        default=ENV_PREVIEW_SAMPLES,
+        help="Send sample preview messages to TEST_CHAT_ID without saving state files.",
+    )
+    return parser.parse_args()
 
 
 def main() -> None:
-    missing = [
-        name for name, val in (
-            ("TELEGRAM_TOKEN", TELEGRAM_TOKEN),
-            ("CHAT_ID", CHAT_ID),
-            ("UNI_USER", UNI_USER),
-            ("UNI_PASS", UNI_PASS),
-        )
-        if not val
-    ]
+    args = parse_args()
+    dry_run: bool         = args.dry_run
+    preview_samples: bool = args.preview_samples
+    test_channel: bool    = args.test_channel or preview_samples
+
+    target_chat_id = TEST_CHAT_ID if test_channel else CHAT_ID
+
+    required = []
+    if not preview_samples:
+        required.extend([("UNI_USER", UNI_USER), ("UNI_PASS", UNI_PASS)])
+    if not dry_run:
+        required.append(("TELEGRAM_TOKEN", TELEGRAM_TOKEN))
+        if test_channel:
+            required.append(("TEST_CHAT_ID", TEST_CHAT_ID))
+        else:
+            required.append(("CHAT_ID", CHAT_ID))
+
+    missing = [name for name, val in required if not val]
     if missing:
         log.error("Missing required environment variable(s): %s", ", ".join(missing))
         sys.exit(1)
+
+    skip_state_save = dry_run or test_channel
+    if skip_state_save:
+        log.info(
+            "Non-production run (dry_run=%s, test_channel=%s, preview_samples=%s): "
+            "state files will not be modified.",
+            dry_run,
+            test_channel,
+            preview_samples,
+        )
+
+    if preview_samples:
+        send_sample_previews(target_chat_id=target_chat_id, dry_run=dry_run)
+        log.info("Sample previews completed.")
+        return
 
     sent_events    = load_ids(EVENTS_FILE)
     sent_grades    = load_ids(GRADES_FILE)
@@ -643,7 +710,7 @@ def main() -> None:
 
     sent_new_ids: set[str] = set()
     for ev in new_events:
-        if send_message(build_event_message(ev)):
+        if send_message(build_event_message(ev), target_chat_id=target_chat_id, dry_run=dry_run):
             sent_events.append(ev["id"])
             sent_new_ids.add(ev["id"])
 
@@ -652,22 +719,25 @@ def main() -> None:
     )
 
     for ev in first_reminders:
-        if send_message(build_reminder_message(ev)):
+        if send_message(build_reminder_message(ev), target_chat_id=target_chat_id, dry_run=dry_run):
             sent_reminders.append(ev["reminder_key"])
 
     for ev in final_reminders:
-        if send_message(build_final_reminder_message(ev)):
+        if send_message(build_final_reminder_message(ev), target_chat_id=target_chat_id, dry_run=dry_run):
             sent_reminders.append(ev["reminder_key"])
 
     new_grades = fetch_grades(session, dashboard_html, sent_grades)
     for grade in new_grades:
-        if send_message(build_grade_message(grade)):
+        if send_message(build_grade_message(grade), target_chat_id=target_chat_id, dry_run=dry_run):
             sent_grades.append(grade["id"])
 
-    save_ids(EVENTS_FILE, sent_events)
-    save_ids(GRADES_FILE, sent_grades)
-    save_ids(REMINDERS_FILE, sent_reminders)
-    log.info("Run completed successfully.")
+    if skip_state_save:
+        log.info("Run completed without modifying state files.")
+    else:
+        save_ids(EVENTS_FILE, sent_events)
+        save_ids(GRADES_FILE, sent_grades)
+        save_ids(REMINDERS_FILE, sent_reminders)
+        log.info("Run completed successfully.")
 
 
 if __name__ == "__main__":
