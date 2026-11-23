@@ -536,6 +536,8 @@ def build_event_message(event: dict[str, Any]) -> str:
         parts.append(f"<b>Details</b>     <i>{e(desc)}</i>")
 
     parts += [
+        "",
+        f"في assignment جديد نزل يا شباب على المنصة لكورس <b>{e(event['course'])}</b>، خشوا شيكوا عليه.",
         _DIVIDER,
         f"<a href='{e(event['link'], quote=True)}'><b>Open in Moodle</b></a>",
     ]
@@ -781,7 +783,7 @@ def main() -> None:
         save_ids(EVENTS_FILE, sent_events)
         save_ids(GRADES_FILE, sent_grades)
         save_ids(REMINDERS_FILE, sent_reminders)
-        log.info("Run completed successfully.") 
+        log.info("Run completed successfully.")
 
 
 if __name__ == "__main__":
